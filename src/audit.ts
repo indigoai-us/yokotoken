@@ -1,14 +1,17 @@
 /**
- * Audit logging module for hq-vault — US-010.
+ * Audit logging module for hq-vault — US-010, extended by US-007.
  *
  * Provides:
  * - Append-only audit log at ~/.hq-vault/audit.log
  * - Logs every secret access (get, store, delete, list) with:
  *   timestamp, token name, operation, secret path, IP
  * - Logs failed auth attempts with: timestamp, IP, reason
+ * - Logs network operations: auth challenges, identity/org/project CRUD,
+ *   access request lifecycle, membership changes (US-007)
  * - Secret values are NEVER logged — only paths and metadata
  * - Log cannot be modified through the API (file-system only)
  * - Supports reading/filtering/tailing the audit log
+ * - Entries include mode ('local' | 'network') to distinguish access context
  */
 
 import fs from 'node:fs';
@@ -23,7 +26,21 @@ export type AuditOperation =
   | 'secret.delete'
   | 'secret.list'
   | 'network-auth.verify'
-  | 'auth.failure';
+  | 'auth.failure'
+  // Network auth operations (US-007)
+  | 'auth.challenge'
+  | 'auth.success'
+  | 'session.expired'
+  // Access request lifecycle (US-007)
+  | 'access_request.created'
+  | 'access_request.approved'
+  | 'access_request.denied'
+  // Identity operations (US-007)
+  | 'identity.created'
+  | 'org.created'
+  | 'project.created'
+  | 'membership.added'
+  | 'membership.removed';
 
 export interface AuditEntry {
   /** ISO 8601 timestamp. */
@@ -38,6 +55,21 @@ export interface AuditEntry {
   ip: string;
   /** Additional context (e.g., failure reason, list prefix). */
   detail: string | null;
+
+  // ── Network audit fields (US-007, optional for backward compat) ──
+
+  /** Identity ID involved in the operation. */
+  identity_id?: string | null;
+  /** Identity name involved in the operation. */
+  identity_name?: string | null;
+  /** Organization scope. */
+  org?: string | null;
+  /** Project scope. */
+  project?: string | null;
+  /** Access mode: 'local' or 'network'. */
+  mode?: 'local' | 'network';
+  /** Session token ID (hash) for network sessions. */
+  session_id?: string | null;
 }
 
 export interface AuditFilterOptions {
@@ -49,6 +81,14 @@ export interface AuditFilterOptions {
   since?: string;
   /** Maximum number of entries to return. */
   limit?: number;
+  /** Filter by identity name (exact match). */
+  identity?: string;
+  /** Filter by organization (exact match). */
+  org?: string;
+  /** Filter by project (exact match). */
+  project?: string;
+  /** Filter by operation (exact match). */
+  operation?: string;
 }
 
 // ─── AuditLogger ────────────────────────────────────────────────────
@@ -104,6 +144,13 @@ export class AuditLogger {
       secretPath?: string | null;
       ip: string;
       detail?: string | null;
+      // Optional network context (US-007)
+      identity_id?: string | null;
+      identity_name?: string | null;
+      org?: string | null;
+      project?: string | null;
+      mode?: 'local' | 'network';
+      session_id?: string | null;
     },
   ): void {
     this.writeEntry({
@@ -113,13 +160,24 @@ export class AuditLogger {
       secretPath: opts.secretPath ?? null,
       ip: opts.ip,
       detail: opts.detail ?? null,
+      identity_id: opts.identity_id ?? undefined,
+      identity_name: opts.identity_name ?? undefined,
+      org: opts.org ?? undefined,
+      project: opts.project ?? undefined,
+      mode: opts.mode,
+      session_id: opts.session_id ?? undefined,
     });
   }
 
   /**
    * Log a failed authentication attempt.
    */
-  logAuthFailure(ip: string, reason: string): void {
+  logAuthFailure(ip: string, reason: string, networkFields?: {
+    identity_id?: string | null;
+    identity_name?: string | null;
+    mode?: 'local' | 'network';
+    session_id?: string | null;
+  }): void {
     this.writeEntry({
       timestamp: new Date().toISOString(),
       operation: 'auth.failure',
@@ -127,6 +185,44 @@ export class AuditLogger {
       secretPath: null,
       ip,
       detail: reason,
+      ...networkFields,
+    });
+  }
+
+  /**
+   * Log a network-related event (US-007).
+   *
+   * Used for auth events, identity/org/project CRUD, access request lifecycle,
+   * and membership changes. NEVER pass secret values to this method.
+   */
+  logNetworkEvent(
+    operation: AuditOperation,
+    opts: {
+      ip: string;
+      identity_id?: string | null;
+      identity_name?: string | null;
+      org?: string | null;
+      project?: string | null;
+      mode?: 'local' | 'network';
+      session_id?: string | null;
+      tokenName?: string | null;
+      secretPath?: string | null;
+      detail?: string | null;
+    },
+  ): void {
+    this.writeEntry({
+      timestamp: new Date().toISOString(),
+      operation,
+      tokenName: opts.tokenName ?? null,
+      secretPath: opts.secretPath ?? null,
+      ip: opts.ip,
+      detail: opts.detail ?? null,
+      identity_id: opts.identity_id ?? null,
+      identity_name: opts.identity_name ?? null,
+      org: opts.org ?? null,
+      project: opts.project ?? null,
+      mode: opts.mode,
+      session_id: opts.session_id ?? null,
     });
   }
 
@@ -210,6 +306,30 @@ export function readAuditLog(
         (e) => new Date(e.timestamp).getTime() >= sinceDate.getTime(),
       );
     }
+  }
+
+  // ── Network audit filters (US-007) ────────────────────────────────
+
+  if (filters?.identity) {
+    const identityFilter = filters.identity;
+    entries = entries.filter(
+      (e) => e.identity_name === identityFilter || e.identity_id === identityFilter,
+    );
+  }
+
+  if (filters?.org) {
+    const orgFilter = filters.org;
+    entries = entries.filter((e) => e.org === orgFilter);
+  }
+
+  if (filters?.project) {
+    const projectFilter = filters.project;
+    entries = entries.filter((e) => e.project === projectFilter);
+  }
+
+  if (filters?.operation) {
+    const opFilter = filters.operation;
+    entries = entries.filter((e) => e.operation === opFilter);
   }
 
   if (filters?.limit && filters.limit > 0) {

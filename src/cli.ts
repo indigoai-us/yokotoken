@@ -27,6 +27,7 @@ import { getDefaultTokenFile, readTokenFile } from './auth.js';
 import { startWebEntry } from './web-entry.js';
 import { startDaemon, stopDaemon, restartDaemon, getDefaultLogFile } from './daemon.js';
 import {
+  AuditLogger,
   readAuditLog,
   tailAuditLog,
   getDefaultAuditLogPath,
@@ -1012,6 +1013,10 @@ program
   .description('Show recent audit log entries')
   .option('--path <path>', 'Filter by secret path (substring match)')
   .option('--token <name>', 'Filter by token name')
+  .option('--identity <name>', 'Filter by identity name or ID')
+  .option('--org <org>', 'Filter by organization name')
+  .option('--project <project>', 'Filter by project name')
+  .option('--operation <op>', 'Filter by operation type (e.g., auth.success, identity.created)')
   .option('--since <datetime>', 'Show entries since this date/time (ISO 8601)')
   .option('--limit <count>', 'Maximum number of entries to show', '50')
   .option('--tail', 'Follow the audit log in real-time')
@@ -1053,6 +1058,10 @@ program
       const entries = readAuditLog(logPath, {
         path: opts.path,
         token: opts.token,
+        identity: opts.identity,
+        org: opts.org,
+        project: opts.project,
+        operation: opts.operation,
         since: opts.since,
         limit: parseInt(opts.limit, 10),
       });
@@ -1072,10 +1081,10 @@ program
       } else {
         // Formatted table output
         process.stdout.write(
-          `${'TIMESTAMP'.padEnd(24)} ${'OPERATION'.padEnd(16)} ${'TOKEN'.padEnd(20)} ${'PATH'.padEnd(30)} ${'IP'.padEnd(16)} DETAIL\n`,
+          `${'TIMESTAMP'.padEnd(24)} ${'OPERATION'.padEnd(24)} ${'TOKEN'.padEnd(20)} ${'PATH'.padEnd(30)} ${'IP'.padEnd(16)} DETAIL\n`,
         );
         process.stdout.write(
-          `${'─'.repeat(24)} ${'─'.repeat(16)} ${'─'.repeat(20)} ${'─'.repeat(30)} ${'─'.repeat(16)} ${'─'.repeat(20)}\n`,
+          `${'─'.repeat(24)} ${'─'.repeat(24)} ${'─'.repeat(20)} ${'─'.repeat(30)} ${'─'.repeat(16)} ${'─'.repeat(20)}\n`,
         );
         for (const entry of entries) {
           process.stdout.write(formatAuditEntry(entry) + '\n');
@@ -1091,14 +1100,24 @@ program
 
 /**
  * Format a single audit entry as a table row.
+ * Includes network audit fields (identity, org, project, mode) when present.
  */
 function formatAuditEntry(entry: AuditEntry): string {
   const ts = entry.timestamp.substring(0, 23).padEnd(24);
-  const op = entry.operation.padEnd(16);
+  const op = entry.operation.padEnd(24);
   const token = (entry.tokenName || '-').padEnd(20);
   const secretPath = (entry.secretPath || '-').padEnd(30);
   const ip = entry.ip.padEnd(16);
-  const detail = entry.detail || '';
+
+  // Build detail with network context when available
+  const parts: string[] = [];
+  if (entry.mode) parts.push(`mode=${entry.mode}`);
+  if (entry.identity_name) parts.push(`identity=${entry.identity_name}`);
+  if (entry.org) parts.push(`org=${entry.org}`);
+  if (entry.project) parts.push(`project=${entry.project}`);
+  if (entry.detail) parts.push(entry.detail);
+  const detail = parts.join(', ') || '';
+
   return `${ts} ${op} ${token} ${secretPath} ${ip} ${detail}`;
 }
 
@@ -1531,6 +1550,17 @@ identityCmd
       try {
         const result = idb.createIdentity(opts.name, opts.type);
 
+        // Audit: log identity creation (US-007)
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('identity.created', {
+          ip: '127.0.0.1',
+          identity_id: result.identity.id,
+          identity_name: result.identity.name,
+          mode: 'local',
+          detail: `type=${result.identity.type}`,
+        });
+        auditLogger.close();
+
         process.stdout.write(`Identity created:\n`);
         process.stdout.write(`  ID:   ${result.identity.id}\n`);
         process.stdout.write(`  Name: ${result.identity.name}\n`);
@@ -1645,6 +1675,19 @@ orgCmd
       try {
         const org = idb.createOrg(opts.name, opts.identity);
 
+        // Audit: log org creation (US-007)
+        const founderIdentity = opts.identity ? idb.getIdentity(opts.identity) : null;
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('org.created', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity ?? null,
+          identity_name: founderIdentity?.name ?? null,
+          org: org.name,
+          mode: 'local',
+          detail: opts.identity ? `founder=${opts.identity}` : null,
+        });
+        auditLogger.close();
+
         process.stdout.write(`Organization created:\n`);
         process.stdout.write(`  ID:   ${org.id}\n`);
         process.stdout.write(`  Name: ${org.name}\n`);
@@ -1719,6 +1762,21 @@ orgCmd
 
       try {
         idb.addOrgMember(opts.org, opts.identity, opts.role);
+
+        // Audit: log membership addition (US-007)
+        const memberIdentity = idb.getIdentity(opts.identity);
+        const orgRecord = idb.getOrg(opts.org);
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('membership.added', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity,
+          identity_name: memberIdentity?.name ?? null,
+          org: orgRecord?.name ?? opts.org,
+          mode: 'local',
+          detail: `role=${opts.role}`,
+        });
+        auditLogger.close();
+
         process.stdout.write(`Added identity ${opts.identity} to org ${opts.org} as ${opts.role}.\n`);
       } finally {
         idb.close();
@@ -1794,6 +1852,21 @@ projectCmd
 
       try {
         const project = idb.createProject(opts.org, opts.name, opts.identity);
+
+        // Audit: log project creation (US-007)
+        const orgRecord = idb.getOrg(opts.org);
+        const founderIdentity = opts.identity ? idb.getIdentity(opts.identity) : null;
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('project.created', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity ?? null,
+          identity_name: founderIdentity?.name ?? null,
+          org: orgRecord?.name ?? opts.org,
+          project: project.name,
+          mode: 'local',
+          detail: opts.identity ? `founder=${opts.identity}` : null,
+        });
+        auditLogger.close();
 
         process.stdout.write(`Project created:\n`);
         process.stdout.write(`  ID:   ${project.id}\n`);
@@ -1871,6 +1944,23 @@ projectCmd
 
       try {
         idb.addProjectMember(opts.project, opts.identity, opts.role);
+
+        // Audit: log project membership addition (US-007)
+        const memberIdentity = idb.getIdentity(opts.identity);
+        const projectRecord = idb.getProject(opts.project);
+        const orgRecord = projectRecord ? idb.getOrg(projectRecord.org_id) : null;
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('membership.added', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity,
+          identity_name: memberIdentity?.name ?? null,
+          org: orgRecord?.name ?? null,
+          project: projectRecord?.name ?? opts.project,
+          mode: 'local',
+          detail: `role=${opts.role}`,
+        });
+        auditLogger.close();
+
         process.stdout.write(`Added identity ${opts.identity} to project ${opts.project} as ${opts.role}.\n`);
       } finally {
         idb.close();
@@ -2226,6 +2316,20 @@ accessRequestsCmd
         const arm = new AccessRequestManager(idb);
         const result = arm.approveRequest(requestId, 'cli-admin');
 
+        // Audit: log access request approval (US-007)
+        const reqIdentity = idb.getIdentity(result.identity_id);
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('access_request.approved', {
+          ip: '127.0.0.1',
+          identity_id: result.identity_id,
+          identity_name: reqIdentity?.name ?? null,
+          org: result.org,
+          project: result.project,
+          mode: 'local',
+          detail: `request_id=${result.request_id}, role=${result.role_requested}, reviewed_by=cli-admin`,
+        });
+        auditLogger.close();
+
         process.stdout.write(`Access request approved:\n`);
         process.stdout.write(`  Request ID: ${result.request_id}\n`);
         process.stdout.write(`  Identity:   ${result.identity_id}\n`);
@@ -2260,6 +2364,20 @@ accessRequestsCmd
       try {
         const arm = new AccessRequestManager(idb);
         const result = arm.denyRequest(requestId, 'cli-admin', opts.reason);
+
+        // Audit: log access request denial (US-007)
+        const reqIdentity = idb.getIdentity(result.identity_id);
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('access_request.denied', {
+          ip: '127.0.0.1',
+          identity_id: result.identity_id,
+          identity_name: reqIdentity?.name ?? null,
+          org: result.org,
+          project: result.project,
+          mode: 'local',
+          detail: `request_id=${result.request_id}, reviewed_by=cli-admin${opts.reason ? ', reason=' + opts.reason : ''}`,
+        });
+        auditLogger.close();
 
         process.stdout.write(`Access request denied:\n`);
         process.stdout.write(`  Request ID: ${result.request_id}\n`);

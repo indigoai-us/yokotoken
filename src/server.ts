@@ -267,6 +267,16 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           return;
         }
 
+        // Audit: log challenge issued (US-007)
+        const identity = state.identityDb?.getIdentity(identityId);
+        state.auditLogger.logNetworkEvent('auth.challenge', {
+          ip: clientIp,
+          identity_id: identityId,
+          identity_name: identity?.name ?? null,
+          mode: 'network',
+          detail: `challenge_id=${challenge.challenge_id}`,
+        });
+
         sendJson(res, 200, challenge);
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to issue challenge';
@@ -314,7 +324,12 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         );
 
         if (!result.success) {
-          state.auditLogger.logAuthFailure(clientIp, `network auth: ${result.error}`);
+          const identity = state.identityDb?.getIdentity(identityId!);
+          state.auditLogger.logAuthFailure(clientIp, `network auth: ${result.error}`, {
+            identity_id: identityId,
+            identity_name: identity?.name ?? null,
+            mode: 'network',
+          });
           const nowLocked = state.rateLimiter.recordFailure(clientIp);
           if (nowLocked) {
             sendJson(res, 429, { error: 'Too many failed attempts. Try again later.' });
@@ -326,10 +341,13 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
 
         // Auth succeeded — clear failure history
         state.rateLimiter.recordSuccess(clientIp);
-        state.auditLogger.logAccess('network-auth.verify', {
-          tokenName: `identity:${result.identity_id}`,
+        const verifiedIdentity = state.identityDb?.getIdentity(result.identity_id!);
+        state.auditLogger.logNetworkEvent('auth.success', {
           ip: clientIp,
-          detail: `identity=${result.identity_id}`,
+          identity_id: result.identity_id,
+          identity_name: verifiedIdentity?.name ?? null,
+          mode: 'network',
+          detail: `session created`,
         });
 
         sendJson(res, 200, {
@@ -379,7 +397,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           return;
         }
 
-        const request = state.accessRequestManager.createRequest({
+        const accessReq = state.accessRequestManager.createRequest({
           identity_id: identityId,
           org,
           project: project || null,
@@ -387,10 +405,22 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           justification,
         });
 
+        // Audit: log access request creation (US-007)
+        const reqIdentity = state.identityDb?.getIdentity(identityId);
+        state.auditLogger.logNetworkEvent('access_request.created', {
+          ip: clientIp,
+          identity_id: identityId,
+          identity_name: reqIdentity?.name ?? null,
+          org,
+          project: project || null,
+          mode: 'network',
+          detail: `request_id=${accessReq.request_id}, role=${roleRequested}`,
+        });
+
         sendJson(res, 201, {
-          request_id: request.request_id,
-          status: request.status,
-          created_at: request.created_at,
+          request_id: accessReq.request_id,
+          status: accessReq.status,
+          created_at: accessReq.created_at,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to create access request';
@@ -669,6 +699,9 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
             tokenName: authenticatedTokenName,
             secretPath,
             ip: clientIp,
+            identity_id: authenticatedIdentityId,
+            identity_name: authenticatedIdentityId ? state.identityDb?.getIdentity(authenticatedIdentityId)?.name : null,
+            mode: state.networkMode ? 'network' : 'local',
           });
           sendJson(res, 200, {
             ok: true,
@@ -715,6 +748,9 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
             tokenName: authenticatedTokenName,
             ip: clientIp,
             detail: prefix ? `prefix=${prefix}` : null,
+            identity_id: authenticatedIdentityId,
+            identity_name: authenticatedIdentityId ? state.identityDb?.getIdentity(authenticatedIdentityId)?.name : null,
+            mode: state.networkMode ? 'network' : 'local',
           });
           sendJson(res, 200, { entries });
         } catch (err) {
@@ -763,6 +799,9 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
             tokenName: authenticatedTokenName,
             secretPath,
             ip: clientIp,
+            identity_id: authenticatedIdentityId,
+            identity_name: authenticatedIdentityId ? state.identityDb?.getIdentity(authenticatedIdentityId)?.name : null,
+            mode: state.networkMode ? 'network' : 'local',
           });
           sendJson(res, 200, {
             path: entry.path,
@@ -817,6 +856,9 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
             tokenName: authenticatedTokenName,
             secretPath,
             ip: clientIp,
+            identity_id: authenticatedIdentityId,
+            identity_name: authenticatedIdentityId ? state.identityDb?.getIdentity(authenticatedIdentityId)?.name : null,
+            mode: state.networkMode ? 'network' : 'local',
           });
           sendJson(res, 200, { ok: true, path: secretPath, message: 'Secret deleted' });
         } catch (err) {
