@@ -33,6 +33,8 @@ export interface TokenRow {
   last_used_at: string | null;
   use_count: number;
   max_uses: number | null;
+  /** Identity ID this token is bound to (for scope-based access control). Null = unscoped. */
+  identity_id: string | null;
 }
 
 export interface VaultMetaRow {
@@ -91,7 +93,8 @@ export class VaultDatabase {
         expires_at   TEXT,
         last_used_at TEXT,
         use_count    INTEGER NOT NULL DEFAULT 0,
-        max_uses     INTEGER
+        max_uses     INTEGER,
+        identity_id  TEXT
       );
 
       CREATE INDEX IF NOT EXISTS idx_token_store_name ON token_store(name);
@@ -221,11 +224,12 @@ export class VaultDatabase {
     tokenHash: string,
     expiresAt?: string | null,
     maxUses?: number | null,
+    identityId?: string | null,
   ): TokenRow {
     this.db.prepare(`
-      INSERT INTO token_store (name, token_hash, expires_at, max_uses)
-      VALUES (?, ?, ?, ?)
-    `).run(name, tokenHash, expiresAt ?? null, maxUses ?? null);
+      INSERT INTO token_store (name, token_hash, expires_at, max_uses, identity_id)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(name, tokenHash, expiresAt ?? null, maxUses ?? null, identityId ?? null);
 
     return this.getTokenByName(name)!;
   }

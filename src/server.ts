@@ -32,6 +32,8 @@ import { ensureCerts, type TlsCertPaths, type TlsCertData } from './tls.js';
 import { TokenManager } from './tokens.js';
 import { VaultDatabase } from './db.js';
 import { AuditLogger } from './audit.js';
+import { IdentityDatabase, getDefaultIdentityDbPath } from './identity.js';
+import { parseScope, checkAccess, filterAccessiblePaths } from './scoping.js';
 
 export interface ServerConfig {
   vaultPath: string;
@@ -49,6 +51,8 @@ export interface ServerConfig {
   token?: string;
   /** Custom audit log path (defaults to ~/.hq-vault/audit.log). */
   auditLogPath?: string;
+  /** Path to the identity database (for scope-based access control). */
+  identityDbPath?: string;
 }
 
 export const DEFAULT_PORT = 13100;
@@ -102,6 +106,8 @@ interface ServerState {
   tokenDb: VaultDatabase;
   /** Audit logger for recording access and auth events. */
   auditLogger: AuditLogger;
+  /** Identity database for scope-based access control (optional). */
+  identityDb: IdentityDatabase | null;
 }
 
 /**
@@ -210,15 +216,19 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
     // Try bootstrap token first, then managed tokens
     let authOk = false;
     let authenticatedTokenName = 'bootstrap';
+    let isBootstrapToken = false;
+    let authenticatedIdentityId: string | null = null;
     if (bearerToken && validateBearerToken(authHeader, state.token)) {
       authOk = true;
       authenticatedTokenName = 'bootstrap';
+      isBootstrapToken = true;
     } else if (bearerToken) {
       // Try managed token validation (US-005)
       const result = state.tokenManager.validate(bearerToken);
       if (result.valid) {
         authOk = true;
         authenticatedTokenName = result.tokenName || 'unknown';
+        authenticatedIdentityId = result.identityId ?? null;
       } else if (result.reason === 'expired') {
         // Expired tokens return 401
         state.auditLogger.logAuthFailure(clientIp, `token expired: ${result.tokenName || 'unknown'}`);
@@ -376,6 +386,23 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           return;
         }
 
+        // ── Scope-based access control (US-002) ─────────────────────
+        // Only enforced when: (a) not bootstrap token, (b) identity DB exists,
+        // (c) the token is bound to an identity. Tokens without identity binding
+        // retain full access for backward compatibility.
+        if (!isBootstrapToken && state.identityDb && authenticatedIdentityId) {
+          const scope = parseScope(secretPath);
+          if (!scope.scoped) {
+            sendJson(res, 403, { error: 'Unscoped secrets are only accessible via bootstrap token' });
+            return;
+          }
+          const accessResult = checkAccess(state.identityDb, authenticatedIdentityId, secretPath, 'write');
+          if (!accessResult.allowed) {
+            sendJson(res, 403, { error: accessResult.reason });
+            return;
+          }
+        }
+
         const body = await parseBody(req);
         const value = body.value as string | undefined;
         if (value === undefined || value === null || typeof value !== 'string') {
@@ -420,7 +447,21 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         const prefix = url2.searchParams.get('prefix') || undefined;
 
         try {
-          const entries = state.vault.list(prefix);
+          let entries = state.vault.list(prefix);
+
+          // ── Scope-based filtering (US-002) ──────────────────────
+          // Only filter when token is bound to an identity. Unbound tokens
+          // retain full list access for backward compatibility.
+          if (!isBootstrapToken && state.identityDb && authenticatedIdentityId) {
+            const accessiblePaths = filterAccessiblePaths(
+              state.identityDb,
+              authenticatedIdentityId,
+              entries.map(e => e.path),
+            );
+            const accessibleSet = new Set(accessiblePaths);
+            entries = entries.filter(e => accessibleSet.has(e.path));
+          }
+
           resetIdleTimer(state);
           // Audit: log list operation
           state.auditLogger.logAccess('secret.list', {
@@ -447,6 +488,20 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         if (!state.vault.isUnlocked) {
           sendJson(res, 403, { error: 'Vault is locked. Unlock it first.' });
           return;
+        }
+
+        // ── Scope-based access control (US-002) ─────────────────────
+        if (!isBootstrapToken && state.identityDb && authenticatedIdentityId) {
+          const scope = parseScope(secretPath);
+          if (!scope.scoped) {
+            sendJson(res, 403, { error: 'Unscoped secrets are only accessible via bootstrap token' });
+            return;
+          }
+          const accessResult = checkAccess(state.identityDb, authenticatedIdentityId, secretPath, 'read');
+          if (!accessResult.allowed) {
+            sendJson(res, 403, { error: accessResult.reason });
+            return;
+          }
         }
 
         try {
@@ -489,6 +544,20 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           return;
         }
 
+        // ── Scope-based access control (US-002) ─────────────────────
+        if (!isBootstrapToken && state.identityDb && authenticatedIdentityId) {
+          const scope = parseScope(secretPath);
+          if (!scope.scoped) {
+            sendJson(res, 403, { error: 'Unscoped secrets are only accessible via bootstrap token' });
+            return;
+          }
+          const accessResult = checkAccess(state.identityDb, authenticatedIdentityId, secretPath, 'write');
+          if (!accessResult.allowed) {
+            sendJson(res, 403, { error: accessResult.reason });
+            return;
+          }
+        }
+
         try {
           const deleted = state.vault.delete(secretPath);
           resetIdleTimer(state);
@@ -518,6 +587,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         const name = body.name as string | undefined;
         const ttl = body.ttl as string | undefined;
         const maxUses = body.max_uses as number | undefined;
+        const identityId = body.identity_id as string | undefined;
 
         if (!name || typeof name !== 'string' || name.trim().length === 0) {
           sendJson(res, 400, { error: 'Token name is required' });
@@ -529,6 +599,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
             name: name.trim(),
             ttl: ttl || null,
             maxUses: maxUses ?? null,
+            identityId: identityId || null,
           });
           resetIdleTimer(state);
           sendJson(res, 201, {
@@ -624,6 +695,27 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
   // Initialize the audit logger
   const auditLogger = new AuditLogger(config.auditLogPath);
 
+  // Initialize the identity database for scope-based access control (optional).
+  // Only load if the identity DB file already exists or an explicit path was given.
+  // This ensures backward compat: servers without identity setup skip scoping entirely.
+  let identityDb: IdentityDatabase | null = null;
+  if (config.identityDbPath) {
+    try {
+      identityDb = new IdentityDatabase(config.identityDbPath);
+    } catch {
+      // Identity DB could not be opened — scoping will be disabled
+    }
+  } else {
+    const defaultIdDbPath = getDefaultIdentityDbPath();
+    if (fs.existsSync(defaultIdDbPath)) {
+      try {
+        identityDb = new IdentityDatabase(defaultIdDbPath);
+      } catch {
+        // Identity DB could not be opened — scoping will be disabled
+      }
+    }
+  }
+
   const state: ServerState = {
     vault: new VaultEngine(config.vaultPath),
     idleTimer: null,
@@ -635,6 +727,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
     tokenManager,
     tokenDb,
     auditLogger,
+    identityDb,
   };
 
   const handler = createRequestHandler(config, state);
@@ -700,6 +793,7 @@ function cleanup(config: ServerConfig, state: ServerState, srv: https.Server | h
   try { state.vault.close(); } catch { /* ok */ }
   try { state.tokenDb.close(); } catch { /* ok */ }
   try { state.auditLogger.close(); } catch { /* ok */ }
+  try { if (state.identityDb) state.identityDb.close(); } catch { /* ok */ }
   try { if (fs.existsSync(config.pidFile)) fs.unlinkSync(config.pidFile); } catch { /* ok */ }
   try { if (fs.existsSync(config.portFile)) fs.unlinkSync(config.portFile); } catch { /* ok */ }
   try { srv.close(); } catch { /* ok */ }

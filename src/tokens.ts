@@ -21,6 +21,8 @@ export interface TokenCreateOptions {
   ttl?: string | null;
   /** Maximum number of times this token can be used. Null = unlimited. */
   maxUses?: number | null;
+  /** Identity ID to bind this token to for scope-based access control. */
+  identityId?: string | null;
 }
 
 export interface TokenCreateResult {
@@ -37,12 +39,16 @@ export interface TokenMetadata {
   lastUsedAt: string | null;
   useCount: number;
   maxUses: number | null;
+  /** Identity ID this token is bound to (for scope-based access control). */
+  identityId: string | null;
 }
 
 export interface TokenValidationResult {
   valid: boolean;
   reason?: 'not_found' | 'expired' | 'max_uses_exceeded';
   tokenName?: string;
+  /** Identity ID bound to this token, if any. */
+  identityId?: string | null;
 }
 
 /**
@@ -144,6 +150,7 @@ export class TokenManager {
       tokenHash,
       expiresAt,
       options.maxUses ?? null,
+      options.identityId ?? null,
     );
 
     return {
@@ -186,7 +193,7 @@ export class TokenManager {
     // Valid — record usage
     this.db.recordTokenUsage(tokenHash);
 
-    return { valid: true, tokenName: row.name };
+    return { valid: true, tokenName: row.name, identityId: row.identity_id };
   }
 
   /**
@@ -232,5 +239,6 @@ function rowToMetadata(row: TokenRow): TokenMetadata {
     lastUsedAt: row.last_used_at,
     useCount: row.use_count,
     maxUses: row.max_uses,
+    identityId: row.identity_id,
   };
 }

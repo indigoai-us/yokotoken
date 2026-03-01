@@ -391,15 +391,33 @@ program
 // ─── store ─────────────────────────────────────────────────────────
 program
   .command('store <path>')
-  .description('Store a secret at the given path')
+  .description('Store a secret at the given path (use --org/--project for scoped secrets)')
   .option('--file <filepath>', 'Read secret value from a file instead of stdin')
   .option('--type <type>', 'Secret type (oauth-token, api-key, password, certificate, other)')
   .option('--description <desc>', 'Human-readable description of the secret')
+  .option('--org <org>', 'Organization scope for the secret')
+  .option('--project <project>', 'Project scope for the secret (requires --org)')
   .action(async (secretPath: string, opts) => {
     try {
       const port = ensureServerRunning();
       const token = getServerToken();
       let value: string;
+
+      // Validate --project requires --org
+      if (opts.project && !opts.org) {
+        process.stderr.write('Error: --project requires --org to be specified\n');
+        process.exit(1);
+      }
+
+      // Build the scoped path if --org is provided
+      let finalPath = secretPath;
+      if (opts.org) {
+        if (opts.project) {
+          finalPath = `org/${opts.org}/project/${opts.project}/${secretPath}`;
+        } else {
+          finalPath = `org/${opts.org}/${secretPath}`;
+        }
+      }
 
       if (opts.file) {
         // Read secret value from file
@@ -420,13 +438,13 @@ program
       const res = await request(
         { port, host: '127.0.0.1', token },
         'PUT',
-        `/v1/secrets/${encodeURIComponent(secretPath)}`,
+        `/v1/secrets/${encodeURIComponent(finalPath)}`,
         body,
       );
 
       if (res.statusCode === 200) {
         const typeStr = opts.type ? ` (${opts.type})` : '';
-        process.stderr.write(`Stored: ${secretPath}${typeStr}, ${res.body.bytes} bytes\n`);
+        process.stderr.write(`Stored: ${finalPath}${typeStr}, ${res.body.bytes} bytes\n`);
       } else {
         process.stderr.write(`Error: ${res.body.error}\n`);
         process.exit(1);
