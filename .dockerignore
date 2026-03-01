@@ -1,0 +1,35 @@
+# Dependency directories
+node_modules/
+
+# Build output (rebuilt inside container)
+dist/
+
+# Version control
+.git/
+.gitignore
+
+# Tests and docs (not needed in production image)
+tests/
+docs/
+vitest.config.ts
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (avoid recursive context)
+Dockerfile
+docker-compose.yml
+.dockerignore
+Makefile
+
+# Development files
+*.md
+LICENSE
+.env*
