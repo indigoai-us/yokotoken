@@ -1449,4 +1449,419 @@ program
     }
   });
 
+// ─── identity ───────────────────────────────────────────────────────
+const identityCmd = program
+  .command('identity')
+  .description('Manage vault identities');
+
+identityCmd
+  .command('create')
+  .description('Create a new identity with an Ed25519 keypair')
+  .requiredOption('--name <name>', 'Identity name')
+  .requiredOption('--type <type>', 'Identity type: human or agent')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const result = idb.createIdentity(opts.name, opts.type);
+
+        process.stdout.write(`Identity created:\n`);
+        process.stdout.write(`  ID:   ${result.identity.id}\n`);
+        process.stdout.write(`  Name: ${result.identity.name}\n`);
+        process.stdout.write(`  Type: ${result.identity.type}\n`);
+        process.stdout.write(`\n`);
+        process.stdout.write(`Private key (save this — it will NOT be shown again):\n`);
+        process.stdout.write(`  ${result.privateKey}\n`);
+        process.stdout.write(`\n`);
+        process.stdout.write(`Public key:\n`);
+        process.stdout.write(`  ${result.publicKey}\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+identityCmd
+  .command('list')
+  .description('List all identities')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const identities = idb.listIdentities();
+
+        if (identities.length === 0) {
+          process.stderr.write('No identities found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(identities, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'ID'.padEnd(34)} ${'NAME'.padEnd(20)} ${'TYPE'.padEnd(8)} CREATED\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(20)} ${'─'.repeat(8)} ${'─'.repeat(20)}\n`,
+          );
+          for (const id of identities) {
+            process.stdout.write(
+              `${id.id.padEnd(34)} ${id.name.padEnd(20)} ${id.type.padEnd(8)} ${id.created_at}\n`,
+            );
+          }
+          process.stderr.write(`\n${identities.length} identity(ies).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+identityCmd
+  .command('verify')
+  .description('Verify an identity using its private key')
+  .requiredOption('--key <privateKey>', 'Base64-encoded Ed25519 private key')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const identity = idb.verifyIdentity(opts.key);
+        if (identity) {
+          process.stdout.write(`Identity verified:\n`);
+          process.stdout.write(`  ID:   ${identity.id}\n`);
+          process.stdout.write(`  Name: ${identity.name}\n`);
+          process.stdout.write(`  Type: ${identity.type}\n`);
+        } else {
+          process.stderr.write('Error: Private key does not match any known identity.\n');
+          process.exit(1);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── org ─────────────────────────────────────────────────────────────
+const orgCmd = program
+  .command('org')
+  .description('Manage organizations');
+
+orgCmd
+  .command('create')
+  .description('Create a new organization')
+  .requiredOption('--name <name>', 'Organization name')
+  .option('--identity <id>', 'Founding identity ID (assigned as admin)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const org = idb.createOrg(opts.name, opts.identity);
+
+        process.stdout.write(`Organization created:\n`);
+        process.stdout.write(`  ID:   ${org.id}\n`);
+        process.stdout.write(`  Name: ${org.name}\n`);
+        if (opts.identity) {
+          process.stdout.write(`  Founder: ${opts.identity} (admin)\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+orgCmd
+  .command('list')
+  .description('List all organizations')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const orgs = idb.listOrgs();
+
+        if (orgs.length === 0) {
+          process.stderr.write('No organizations found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(orgs, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'ID'.padEnd(34)} ${'NAME'.padEnd(24)} CREATED\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(24)} ${'─'.repeat(20)}\n`,
+          );
+          for (const org of orgs) {
+            process.stdout.write(
+              `${org.id.padEnd(34)} ${org.name.padEnd(24)} ${org.created_at}\n`,
+            );
+          }
+          process.stderr.write(`\n${orgs.length} organization(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+orgCmd
+  .command('add-member')
+  .description('Add a member to an organization')
+  .requiredOption('--org <orgId>', 'Organization ID')
+  .requiredOption('--identity <identityId>', 'Identity ID to add')
+  .requiredOption('--role <role>', 'Role: admin, member, or readonly')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        idb.addOrgMember(opts.org, opts.identity, opts.role);
+        process.stdout.write(`Added identity ${opts.identity} to org ${opts.org} as ${opts.role}.\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+orgCmd
+  .command('members')
+  .description('List members of an organization')
+  .requiredOption('--org <orgId>', 'Organization ID')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const members = idb.listOrgMembers(opts.org);
+
+        if (members.length === 0) {
+          process.stderr.write('No members found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(members, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'IDENTITY ID'.padEnd(34)} ${'NAME'.padEnd(20)} ${'TYPE'.padEnd(8)} ROLE\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(20)} ${'─'.repeat(8)} ${'─'.repeat(10)}\n`,
+          );
+          for (const m of members) {
+            process.stdout.write(
+              `${m.identity_id.padEnd(34)} ${m.name.padEnd(20)} ${m.type.padEnd(8)} ${m.role}\n`,
+            );
+          }
+          process.stderr.write(`\n${members.length} member(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── project ─────────────────────────────────────────────────────────
+const projectCmd = program
+  .command('project')
+  .description('Manage projects within organizations');
+
+projectCmd
+  .command('create')
+  .description('Create a new project within an organization')
+  .requiredOption('--org <orgId>', 'Organization ID')
+  .requiredOption('--name <name>', 'Project name')
+  .option('--identity <id>', 'Founding identity ID (assigned as admin)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const project = idb.createProject(opts.org, opts.name, opts.identity);
+
+        process.stdout.write(`Project created:\n`);
+        process.stdout.write(`  ID:   ${project.id}\n`);
+        process.stdout.write(`  Name: ${project.name}\n`);
+        process.stdout.write(`  Org:  ${project.org_id}\n`);
+        if (opts.identity) {
+          process.stdout.write(`  Founder: ${opts.identity} (admin)\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('list')
+  .description('List projects in an organization')
+  .requiredOption('--org <orgId>', 'Organization ID')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const projects = idb.listProjects(opts.org);
+
+        if (projects.length === 0) {
+          process.stderr.write('No projects found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(projects, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'ID'.padEnd(34)} ${'NAME'.padEnd(24)} CREATED\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(24)} ${'─'.repeat(20)}\n`,
+          );
+          for (const p of projects) {
+            process.stdout.write(
+              `${p.id.padEnd(34)} ${p.name.padEnd(24)} ${p.created_at}\n`,
+            );
+          }
+          process.stderr.write(`\n${projects.length} project(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('add-member')
+  .description('Add a member to a project')
+  .requiredOption('--project <projectId>', 'Project ID')
+  .requiredOption('--identity <identityId>', 'Identity ID to add')
+  .requiredOption('--role <role>', 'Role: admin, member, or readonly')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        idb.addProjectMember(opts.project, opts.identity, opts.role);
+        process.stdout.write(`Added identity ${opts.identity} to project ${opts.project} as ${opts.role}.\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('members')
+  .description('List members of a project')
+  .requiredOption('--project <projectId>', 'Project ID')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const members = idb.listProjectMembers(opts.project);
+
+        if (members.length === 0) {
+          process.stderr.write('No members found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(members, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'IDENTITY ID'.padEnd(34)} ${'NAME'.padEnd(20)} ${'TYPE'.padEnd(8)} ROLE\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(20)} ${'─'.repeat(8)} ${'─'.repeat(10)}\n`,
+          );
+          for (const m of members) {
+            process.stdout.write(
+              `${m.identity_id.padEnd(34)} ${m.name.padEnd(20)} ${m.type.padEnd(8)} ${m.role}\n`,
+            );
+          }
+          process.stderr.write(`\n${members.length} member(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
 program.parse();

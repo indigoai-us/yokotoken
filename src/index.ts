@@ -101,3 +101,17 @@ export type {
   ImportDuplicate,
   EnvEntry,
 } from './backup.js';
+export {
+  IdentityDatabase,
+  getDefaultIdentityDbPath,
+} from './identity.js';
+export type {
+  Identity,
+  IdentityType,
+  Org,
+  Project,
+  OrgMember,
+  ProjectMember,
+  MemberRole,
+  IdentityCreateResult,
+} from './identity.js';
