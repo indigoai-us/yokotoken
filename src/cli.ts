@@ -159,6 +159,10 @@ program
   .option('--vault-path <path>', 'Path to vault database', getDefaultVaultPath())
   .option('--idle-timeout <minutes>', 'Auto-lock after N minutes of inactivity (0 to disable)', '30')
   .option('--insecure', 'Use plain HTTP instead of HTTPS (NOT recommended)')
+  .option('--network', 'Enable network mode: bind to 0.0.0.0, require TLS and identity auth')
+  .option('--bind <address>', 'Custom bind address (default: 127.0.0.1 for local, 0.0.0.0 for network)')
+  .option('--tls-cert <path>', 'Path to TLS certificate file (PEM)')
+  .option('--tls-key <path>', 'Path to TLS private key file (PEM)')
   .option('--daemon', 'Run the server as a background daemon process')
   .option('--stop', 'Stop a running daemon')
   .option('--restart', 'Restart the daemon')
@@ -231,6 +235,29 @@ program
       const idleTimeoutMs = idleTimeoutMinutes * 60 * 1000;
       const pidFile = getDefaultPidFile();
       const portFile = getDefaultPortFile();
+      const isNetwork = opts.network || false;
+
+      // ── Network mode CLI validations ─────────────────────────
+      if (isNetwork && opts.insecure) {
+        process.stderr.write('Error: Cannot use --insecure with --network. Network mode requires TLS.\n');
+        process.exit(1);
+      }
+
+      // Validate --tls-cert and --tls-key are provided together
+      if ((opts.tlsCert && !opts.tlsKey) || (!opts.tlsCert && opts.tlsKey)) {
+        process.stderr.write('Error: --tls-cert and --tls-key must be provided together.\n');
+        process.exit(1);
+      }
+
+      // Validate cert/key files exist
+      if (opts.tlsCert && !fs.existsSync(opts.tlsCert)) {
+        process.stderr.write(`Error: TLS certificate file not found: ${opts.tlsCert}\n`);
+        process.exit(1);
+      }
+      if (opts.tlsKey && !fs.existsSync(opts.tlsKey)) {
+        process.stderr.write(`Error: TLS key file not found: ${opts.tlsKey}\n`);
+        process.exit(1);
+      }
 
       // Check if server is already running
       const { running, pid } = isServerRunning(pidFile);
@@ -255,13 +282,21 @@ program
         pidFile,
         portFile,
         insecure: opts.insecure || false,
+        network: isNetwork,
+        bindAddress: opts.bind || undefined,
+        tlsCertFile: opts.tlsCert || undefined,
+        tlsKeyFile: opts.tlsKey || undefined,
       });
 
       const addr = server.address();
       const boundPort = typeof addr === 'object' && addr ? addr.port : port;
       const protocol = opts.insecure ? 'http' : 'https';
+      const bindAddr = opts.bind || (isNetwork ? '0.0.0.0' : '127.0.0.1');
 
-      process.stderr.write(`hq-vault server listening on ${protocol}://127.0.0.1:${boundPort}\n`);
+      process.stderr.write(`hq-vault server listening on ${protocol}://${bindAddr}:${boundPort}\n`);
+      if (isNetwork) {
+        process.stderr.write('Mode: NETWORK (identity-based auth only, bootstrap token disabled)\n');
+      }
       process.stderr.write(`Vault path: ${vaultPath}\n`);
       if (idleTimeoutMinutes > 0) {
         process.stderr.write(`Auto-lock: ${idleTimeoutMinutes} minutes\n`);

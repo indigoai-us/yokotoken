@@ -59,6 +59,14 @@ export interface ServerConfig {
   challengeTtlMs?: number;
   /** Session token TTL in ms for network auth (default: 1h). */
   sessionTtlMs?: number;
+  /** If true, enable network mode: bind to 0.0.0.0, require TLS and identity auth. */
+  network?: boolean;
+  /** Bind address override. Defaults to '127.0.0.1' for local, '0.0.0.0' for network. */
+  bindAddress?: string;
+  /** Custom TLS certificate file path (for CA-signed certs). */
+  tlsCertFile?: string;
+  /** Custom TLS key file path (for CA-signed certs). */
+  tlsKeyFile?: string;
 }
 
 export const DEFAULT_PORT = 13100;
@@ -118,6 +126,8 @@ interface ServerState {
   networkAuth: NetworkAuthenticator | null;
   /** Access request manager (US-004). */
   accessRequestManager: AccessRequestManager | null;
+  /** Whether the server is running in network mode. */
+  networkMode: boolean;
 }
 
 /**
@@ -195,14 +205,32 @@ function getClientIp(req: http.IncomingMessage): string {
  */
 function createRequestHandler(config: ServerConfig, state: ServerState) {
   return async (req: http.IncomingMessage, res: http.ServerResponse) => {
-    // Only allow localhost connections
-    const remoteAddr = req.socket.remoteAddress;
-    if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1' && remoteAddr !== '::ffff:127.0.0.1') {
-      sendJson(res, 403, { error: 'Forbidden' });
-      return;
+    const clientIp = getClientIp(req);
+
+    // In local mode, only allow localhost connections
+    if (!state.networkMode) {
+      const remoteAddr = req.socket.remoteAddress;
+      if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1' && remoteAddr !== '::ffff:127.0.0.1') {
+        sendJson(res, 403, { error: 'Forbidden' });
+        return;
+      }
     }
 
-    const clientIp = getClientIp(req);
+    // In network mode, log remote IP for all requests
+    if (state.networkMode) {
+      process.stderr.write(`[hq-vault] ${req.method} ${req.url} from ${clientIp}\n`);
+    }
+
+    // ── Health endpoint (no auth required, no information leakage) ──
+    const healthUrl = new URL(req.url || '/', `https://localhost:${config.port}`);
+    if (req.method === 'GET' && healthUrl.pathname === '/v1/health') {
+      sendJson(res, 200, {
+        status: 'ok',
+        version: '0.1.0',
+        mode: state.networkMode ? 'network' : 'local',
+      });
+      return;
+    }
 
     // ── Rate limit check ──────────────────────────────────────────
     const lockoutMs = state.rateLimiter.isLocked(clientIp);
@@ -421,12 +449,12 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
       }
     }
 
-    // Try bootstrap token first, then managed tokens
+    // Try bootstrap token first (disabled in network mode), then managed tokens
     let authOk = false;
     let authenticatedTokenName = 'bootstrap';
     let isBootstrapToken = false;
     let authenticatedIdentityId: string | null = null;
-    if (bearerToken && validateBearerToken(authHeader, state.token)) {
+    if (!state.networkMode && bearerToken && validateBearerToken(authHeader, state.token)) {
       authOk = true;
       authenticatedTokenName = 'bootstrap';
       isBootstrapToken = true;
@@ -585,6 +613,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           port: state.boundPort,
           idleTimeoutMs: state.idleTimeoutMs,
           lastActivity: new Date(state.lastActivity).toISOString(),
+          mode: state.networkMode ? 'network' : 'local',
         });
         return;
       }
@@ -899,11 +928,42 @@ let server: https.Server | http.Server;
  * Pass `insecure: true` in config for plain HTTP (testing only).
  */
 export function createVaultServer(config: ServerConfig): Promise<https.Server | http.Server> {
+  const isNetwork = config.network === true;
+
+  // ── Network mode validations (before allocating resources) ─────────
+  if (isNetwork) {
+    // Network mode REQUIRES TLS — refuse --insecure
+    if (config.insecure) {
+      throw new Error('Network mode requires TLS. Cannot use --insecure with --network.');
+    }
+
+    // Network mode REQUIRES at least one identity to exist.
+    // We do a lightweight pre-check here before opening all the long-lived resources.
+    let preCheckIdentityDb: IdentityDatabase | null = null;
+    try {
+      const idDbPath = config.identityDbPath || getDefaultIdentityDbPath();
+      if (!fs.existsSync(idDbPath)) {
+        throw new Error(
+          'Network mode requires an identity database. Create at least one identity first with: hq-vault identity create',
+        );
+      }
+      preCheckIdentityDb = new IdentityDatabase(idDbPath);
+      const identities = preCheckIdentityDb.listIdentities();
+      if (identities.length === 0) {
+        throw new Error(
+          'Network mode requires at least one identity. Create one first with: hq-vault identity create',
+        );
+      }
+    } finally {
+      try { if (preCheckIdentityDb) preCheckIdentityDb.close(); } catch { /* ok */ }
+    }
+  }
+
   // Generate or retrieve the bearer token
   const tokenFile = config.tokenFile || path.join(path.dirname(config.pidFile), 'token');
   const token = config.token || generateToken();
 
-  // Write the token file
+  // Write the token file (even in network mode, for internal management)
   writeTokenFile(tokenFile, token);
 
   // Open a database connection for the token manager (separate from VaultEngine's)
@@ -964,16 +1024,38 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
     identityDb,
     networkAuth,
     accessRequestManager,
+    networkMode: isNetwork,
   };
 
   const handler = createRequestHandler(config, state);
 
   if (config.insecure) {
-    // Plain HTTP for testing
+    // Plain HTTP for testing (never allowed in network mode — validated above)
     server = http.createServer(handler);
   } else {
-    // HTTPS with self-signed certs
-    const certData = config.tlsCertData || ensureCerts(config.tlsCertPaths);
+    // HTTPS — use custom cert paths or auto-generated self-signed certs
+    let certData: TlsCertData;
+    if (config.tlsCertFile && config.tlsKeyFile) {
+      // Custom CA-signed or user-provided certs
+      certData = {
+        cert: fs.readFileSync(config.tlsCertFile, 'utf-8'),
+        key: fs.readFileSync(config.tlsKeyFile, 'utf-8'),
+      };
+    } else if (config.tlsCertData) {
+      certData = config.tlsCertData;
+    } else {
+      certData = ensureCerts(config.tlsCertPaths);
+      // In network mode, print a loud warning about self-signed certs
+      if (isNetwork) {
+        process.stderr.write('\n');
+        process.stderr.write('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n');
+        process.stderr.write('!!! WARNING: Using auto-generated self-signed certificate.  !!!\n');
+        process.stderr.write('!!! This is NOT suitable for production use.                !!!\n');
+        process.stderr.write('!!! Use --tls-cert and --tls-key with CA-signed certs.      !!!\n');
+        process.stderr.write('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n');
+        process.stderr.write('\n');
+      }
+    }
     server = https.createServer(
       {
         cert: certData.cert,
@@ -991,8 +1073,11 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
 
+  // Determine bind address
+  const bindAddress = config.bindAddress || (isNetwork ? '0.0.0.0' : '127.0.0.1');
+
   return new Promise((resolve, reject) => {
-    server.listen(config.port, '127.0.0.1', () => {
+    server.listen(config.port, bindAddress, () => {
       // Capture actual bound port (important when config.port is 0)
       const addr = server.address();
       if (typeof addr === 'object' && addr) {
