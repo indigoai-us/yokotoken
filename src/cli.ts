@@ -1882,4 +1882,127 @@ projectCmd
     }
   });
 
+// ─── auth ───────────────────────────────────────────────────────────
+const authCmd = program
+  .command('auth')
+  .description('Network authentication (challenge-response)');
+
+authCmd
+  .command('login')
+  .description('Authenticate using Ed25519 keypair (challenge-response flow)')
+  .requiredOption('--identity <name>', 'Identity name')
+  .requiredOption('--key <path>', 'Path to Ed25519 private key file (base64)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const port = ensureServerRunning();
+
+      // Read the private key from file
+      if (!fs.existsSync(opts.key)) {
+        process.stderr.write(`Error: Key file not found: ${opts.key}\n`);
+        process.exit(1);
+      }
+      const privateKeyBase64 = fs.readFileSync(opts.key, 'utf-8').trim();
+
+      // We need to extract the public key from the private key and the identity ID
+      // Look up the identity by name in the identity database
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      let identityId: string;
+      let publicKeyBase64: string;
+      try {
+        const identity = idb.getIdentityByName(opts.identity);
+        if (!identity) {
+          process.stderr.write(`Error: Identity '${opts.identity}' not found\n`);
+          process.exit(1);
+        }
+        identityId = identity.id;
+
+        // Extract public key from private key using sodium
+        const sodium = (await import('sodium-native')).default;
+        const secretKey = Buffer.from(privateKeyBase64, 'base64');
+        if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
+          process.stderr.write(`Error: Invalid private key length\n`);
+          process.exit(1);
+        }
+        const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
+        sodium.crypto_sign_ed25519_sk_to_pk(publicKey, secretKey);
+        publicKeyBase64 = publicKey.toString('base64');
+
+        // Step 1: Request a challenge
+        const challengeRes = await request(
+          { port, host: '127.0.0.1', token: undefined, insecure: true },
+          'POST',
+          '/v1/auth/challenge',
+          { identity_id: identityId },
+        );
+
+        if (challengeRes.statusCode !== 200) {
+          process.stderr.write(`Error: Failed to get challenge: ${(challengeRes.body as Record<string, unknown>).error || 'unknown error'}\n`);
+          process.exit(1);
+        }
+
+        const challengeNonce = Buffer.from(challengeRes.body.challenge as string, 'base64url');
+        const challengeId = challengeRes.body.challenge_id as string;
+
+        // Step 2: Sign the challenge nonce
+        const { ed25519Sign } = await import('./network-auth.js');
+        const signature = ed25519Sign(challengeNonce, secretKey);
+        const signatureBase64url = signature.toString('base64url');
+
+        // Zero out the secret key
+        sodium.sodium_memzero(secretKey);
+
+        // Step 3: Verify the signature and get a session token
+        const verifyRes = await request(
+          { port, host: '127.0.0.1', token: undefined, insecure: true },
+          'POST',
+          '/v1/auth/verify',
+          {
+            challenge_id: challengeId,
+            identity_id: identityId,
+            signature: signatureBase64url,
+            public_key: publicKeyBase64,
+          },
+        );
+
+        if (verifyRes.statusCode !== 200) {
+          process.stderr.write(`Error: Authentication failed: ${(verifyRes.body as Record<string, unknown>).error || 'unknown error'}\n`);
+          process.exit(1);
+        }
+
+        const sessionToken = verifyRes.body.session_token as string;
+        const expiresIn = verifyRes.body.expires_in as number;
+
+        // Cache the session token to the token file location
+        const { getVaultDir } = await import('./server.js');
+        const path = await import('node:path');
+        const sessionTokenFile = path.join(getVaultDir(), 'session-token');
+        fs.writeFileSync(sessionTokenFile, sessionToken, { encoding: 'utf-8', mode: 0o600 });
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify({
+            ok: true,
+            identity_id: identityId,
+            identity_name: opts.identity,
+            session_token_file: sessionTokenFile,
+            expires_in: expiresIn,
+          }, null, 2) + '\n');
+        } else {
+          process.stdout.write(`Authenticated as '${opts.identity}' (${identityId})\n`);
+          process.stdout.write(`Session token cached at: ${sessionTokenFile}\n`);
+          process.stdout.write(`Expires in: ${expiresIn} seconds\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
 program.parse();

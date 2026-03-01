@@ -22,6 +22,7 @@ export type AuditOperation =
   | 'secret.store'
   | 'secret.delete'
   | 'secret.list'
+  | 'network-auth.verify'
   | 'auth.failure';
 
 export interface AuditEntry {

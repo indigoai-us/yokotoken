@@ -34,6 +34,7 @@ import { VaultDatabase } from './db.js';
 import { AuditLogger } from './audit.js';
 import { IdentityDatabase, getDefaultIdentityDbPath } from './identity.js';
 import { parseScope, checkAccess, filterAccessiblePaths } from './scoping.js';
+import { NetworkAuthenticator } from './network-auth.js';
 
 export interface ServerConfig {
   vaultPath: string;
@@ -53,6 +54,10 @@ export interface ServerConfig {
   auditLogPath?: string;
   /** Path to the identity database (for scope-based access control). */
   identityDbPath?: string;
+  /** Challenge TTL in ms for network auth (default: 60s). */
+  challengeTtlMs?: number;
+  /** Session token TTL in ms for network auth (default: 1h). */
+  sessionTtlMs?: number;
 }
 
 export const DEFAULT_PORT = 13100;
@@ -108,6 +113,8 @@ interface ServerState {
   auditLogger: AuditLogger;
   /** Identity database for scope-based access control (optional). */
   identityDb: IdentityDatabase | null;
+  /** Network authenticator for challenge-response auth (US-003). */
+  networkAuth: NetworkAuthenticator | null;
 }
 
 /**
@@ -201,6 +208,112 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
       return;
     }
 
+    // ── Network auth endpoints (unauthenticated — challenge-response flow) ──
+    const url0 = new URL(req.url || '/', `https://localhost:${config.port}`);
+    const pathname0 = url0.pathname;
+
+    // POST /v1/auth/challenge — Issue a challenge nonce (no token needed)
+    if (req.method === 'POST' && pathname0 === '/v1/auth/challenge') {
+      if (!state.networkAuth) {
+        sendJson(res, 501, { error: 'Network authentication is not configured (no identity database)' });
+        return;
+      }
+
+      try {
+        const body = await parseBody(req);
+        const identityId = body.identity_id as string | undefined;
+        if (!identityId || typeof identityId !== 'string') {
+          sendJson(res, 400, { error: 'identity_id is required' });
+          return;
+        }
+
+        const challenge = state.networkAuth.issueChallenge(identityId);
+        if (!challenge) {
+          // Don't reveal whether the identity exists — just return a generic error
+          // But rate-limit to prevent enumeration
+          state.rateLimiter.recordFailure(clientIp);
+          sendJson(res, 400, { error: 'Unable to issue challenge' });
+          return;
+        }
+
+        sendJson(res, 200, challenge);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to issue challenge';
+        sendJson(res, 500, { error: message });
+      }
+      return;
+    }
+
+    // POST /v1/auth/verify — Verify a signed challenge and get a session token
+    if (req.method === 'POST' && pathname0 === '/v1/auth/verify') {
+      if (!state.networkAuth) {
+        sendJson(res, 501, { error: 'Network authentication is not configured (no identity database)' });
+        return;
+      }
+
+      try {
+        const body = await parseBody(req);
+        const challengeId = body.challenge_id as string | undefined;
+        const identityId = body.identity_id as string | undefined;
+        const signature = body.signature as string | undefined;
+        const publicKey = body.public_key as string | undefined;
+
+        if (!challengeId || typeof challengeId !== 'string') {
+          sendJson(res, 400, { error: 'challenge_id is required' });
+          return;
+        }
+        if (!identityId || typeof identityId !== 'string') {
+          sendJson(res, 400, { error: 'identity_id is required' });
+          return;
+        }
+        if (!signature || typeof signature !== 'string') {
+          sendJson(res, 400, { error: 'signature is required' });
+          return;
+        }
+        if (!publicKey || typeof publicKey !== 'string') {
+          sendJson(res, 400, { error: 'public_key is required' });
+          return;
+        }
+
+        const result = state.networkAuth.verifyChallenge(
+          challengeId,
+          identityId,
+          signature,
+          publicKey,
+        );
+
+        if (!result.success) {
+          state.auditLogger.logAuthFailure(clientIp, `network auth: ${result.error}`);
+          const nowLocked = state.rateLimiter.recordFailure(clientIp);
+          if (nowLocked) {
+            sendJson(res, 429, { error: 'Too many failed attempts. Try again later.' });
+          } else {
+            sendJson(res, 401, { error: result.error || 'Authentication failed' });
+          }
+          return;
+        }
+
+        // Auth succeeded — clear failure history
+        state.rateLimiter.recordSuccess(clientIp);
+        state.auditLogger.logAccess('network-auth.verify', {
+          tokenName: `identity:${result.identity_id}`,
+          ip: clientIp,
+          detail: `identity=${result.identity_id}`,
+        });
+
+        sendJson(res, 200, {
+          ok: true,
+          session_token: result.session_token,
+          expires_in: result.expires_in,
+          identity_id: result.identity_id,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to verify challenge';
+        sendJson(res, 500, { error: message });
+      }
+      return;
+    }
+
     // ── Bearer token auth ─────────────────────────────────────────
     const authHeader = req.headers['authorization'] as string | undefined;
 
@@ -249,6 +362,16 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           sendJson(res, 401, { error: 'Unauthorized' });
         }
         return;
+      }
+    }
+
+    // Try network auth session token (US-003)
+    if (!authOk && bearerToken && state.networkAuth) {
+      const sessionResult = state.networkAuth.validateSession(bearerToken);
+      if (sessionResult.valid && sessionResult.session) {
+        authOk = true;
+        authenticatedTokenName = `session:${sessionResult.session.identity_id}`;
+        authenticatedIdentityId = sessionResult.session.identity_id;
       }
     }
 
@@ -716,6 +839,16 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
     }
   }
 
+  // Initialize network authenticator if identity DB is available (US-003).
+  let networkAuth: NetworkAuthenticator | null = null;
+  if (identityDb) {
+    networkAuth = new NetworkAuthenticator(
+      identityDb,
+      config.challengeTtlMs,
+      config.sessionTtlMs,
+    );
+  }
+
   const state: ServerState = {
     vault: new VaultEngine(config.vaultPath),
     idleTimer: null,
@@ -728,6 +861,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
     tokenDb,
     auditLogger,
     identityDb,
+    networkAuth,
   };
 
   const handler = createRequestHandler(config, state);
@@ -794,6 +928,7 @@ function cleanup(config: ServerConfig, state: ServerState, srv: https.Server | h
   try { state.tokenDb.close(); } catch { /* ok */ }
   try { state.auditLogger.close(); } catch { /* ok */ }
   try { if (state.identityDb) state.identityDb.close(); } catch { /* ok */ }
+  try { if (state.networkAuth) state.networkAuth.close(); } catch { /* ok */ }
   try { if (fs.existsSync(config.pidFile)) fs.unlinkSync(config.pidFile); } catch { /* ok */ }
   try { if (fs.existsSync(config.portFile)) fs.unlinkSync(config.portFile); } catch { /* ok */ }
   try { srv.close(); } catch { /* ok */ }
