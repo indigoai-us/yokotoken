@@ -32,10 +32,10 @@ import os from 'node:os';
 let tmpDir: string;
 let db: IdentityDatabase;
 
-function createTestDb(): IdentityDatabase {
+async function createTestDb(): Promise<IdentityDatabase> {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-identity-'));
   const dbPath = path.join(tmpDir, 'identity.db');
-  return new IdentityDatabase(dbPath);
+  return await IdentityDatabase.open(dbPath);
 }
 
 function cleanupTestDb(): void {
@@ -47,8 +47,8 @@ function cleanupTestDb(): void {
   }
 }
 
-beforeEach(() => {
-  db = createTestDb();
+beforeEach(async () => {
+  db = await createTestDb();
 });
 
 afterEach(() => {
@@ -58,8 +58,8 @@ afterEach(() => {
 // ─── Identity CRUD ────────────────────────────────────────────────
 
 describe('Identity — create', () => {
-  it('should create a human identity with Ed25519 keypair', () => {
-    const result = db.createIdentity('alice', 'human');
+  it('should create a human identity with Ed25519 keypair', async () => {
+    const result = await db.createIdentity('alice', 'human');
 
     expect(result.identity).toBeDefined();
     expect(result.identity.name).toBe('alice');
@@ -79,16 +79,16 @@ describe('Identity — create', () => {
     expect(pkBuf.length).toBe(32);
   });
 
-  it('should create an agent identity', () => {
-    const result = db.createIdentity('ci-bot', 'agent');
+  it('should create an agent identity', async () => {
+    const result = await db.createIdentity('ci-bot', 'agent');
 
     expect(result.identity.name).toBe('ci-bot');
     expect(result.identity.type).toBe('agent');
   });
 
-  it('should generate unique keypairs for each identity', () => {
-    const r1 = db.createIdentity('alice', 'human');
-    const r2 = db.createIdentity('bob', 'human');
+  it('should generate unique keypairs for each identity', async () => {
+    const r1 = await db.createIdentity('alice', 'human');
+    const r2 = await db.createIdentity('bob', 'human');
 
     expect(r1.privateKey).not.toBe(r2.privateKey);
     expect(r1.publicKey).not.toBe(r2.publicKey);
@@ -96,26 +96,26 @@ describe('Identity — create', () => {
     expect(r1.identity.id).not.toBe(r2.identity.id);
   });
 
-  it('should trim whitespace from name', () => {
-    const result = db.createIdentity('  alice  ', 'human');
+  it('should trim whitespace from name', async () => {
+    const result = await db.createIdentity('  alice  ', 'human');
     expect(result.identity.name).toBe('alice');
   });
 
-  it('should reject empty name', () => {
-    expect(() => db.createIdentity('', 'human')).toThrow('Identity name cannot be empty');
-    expect(() => db.createIdentity('   ', 'human')).toThrow('Identity name cannot be empty');
+  it('should reject empty name', async () => {
+    await expect(db.createIdentity('', 'human')).rejects.toThrow('Identity name cannot be empty');
+    await expect(db.createIdentity('   ', 'human')).rejects.toThrow('Identity name cannot be empty');
   });
 
-  it('should reject invalid type', () => {
-    expect(() => db.createIdentity('alice', 'robot' as IdentityType)).toThrow(
+  it('should reject invalid type', async () => {
+    await expect(db.createIdentity('alice', 'robot' as IdentityType)).rejects.toThrow(
       "Invalid identity type: 'robot'"
     );
   });
 });
 
 describe('Identity — get & list', () => {
-  it('should get identity by ID', () => {
-    const { identity } = db.createIdentity('alice', 'human');
+  it('should get identity by ID', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
     const found = db.getIdentity(identity.id);
 
     expect(found).not.toBeNull();
@@ -123,8 +123,8 @@ describe('Identity — get & list', () => {
     expect(found!.type).toBe('human');
   });
 
-  it('should get identity by name', () => {
-    db.createIdentity('alice', 'human');
+  it('should get identity by name', async () => {
+    await db.createIdentity('alice', 'human');
     const found = db.getIdentityByName('alice');
 
     expect(found).not.toBeNull();
@@ -136,10 +136,10 @@ describe('Identity — get & list', () => {
     expect(db.getIdentityByName('nonexistent')).toBeNull();
   });
 
-  it('should list all identities in creation order', () => {
-    db.createIdentity('alice', 'human');
-    db.createIdentity('bob', 'agent');
-    db.createIdentity('charlie', 'human');
+  it('should list all identities in creation order', async () => {
+    await db.createIdentity('alice', 'human');
+    await db.createIdentity('bob', 'agent');
+    await db.createIdentity('charlie', 'human');
 
     const identities = db.listIdentities();
     expect(identities).toHaveLength(3);
@@ -154,8 +154,8 @@ describe('Identity — get & list', () => {
 });
 
 describe('Identity — delete', () => {
-  it('should delete an identity', () => {
-    const { identity } = db.createIdentity('alice', 'human');
+  it('should delete an identity', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
     expect(db.deleteIdentity(identity.id)).toBe(true);
     expect(db.getIdentity(identity.id)).toBeNull();
   });
@@ -164,9 +164,9 @@ describe('Identity — delete', () => {
     expect(db.deleteIdentity('nonexistent')).toBe(false);
   });
 
-  it('should cascade-delete org memberships when identity is deleted', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
+  it('should cascade-delete org memberships when identity is deleted', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
 
     expect(db.listOrgMembers(org.id)).toHaveLength(1);
 
@@ -174,10 +174,10 @@ describe('Identity — delete', () => {
     expect(db.listOrgMembers(org.id)).toHaveLength(0);
   });
 
-  it('should cascade-delete project memberships when identity is deleted', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
-    const project = db.createProject(org.id, 'my-project', identity.id);
+  it('should cascade-delete project memberships when identity is deleted', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
+    const project = await db.createProject(org.id, 'my-project', identity.id);
 
     expect(db.listProjectMembers(project.id)).toHaveLength(1);
 
@@ -187,42 +187,42 @@ describe('Identity — delete', () => {
 });
 
 describe('Identity — verify', () => {
-  it('should verify an identity with its private key', () => {
-    const result = db.createIdentity('alice', 'human');
+  it('should verify an identity with its private key', async () => {
+    const result = await db.createIdentity('alice', 'human');
 
-    const verified = db.verifyIdentity(result.privateKey);
+    const verified = await db.verifyIdentity(result.privateKey);
     expect(verified).not.toBeNull();
     expect(verified!.id).toBe(result.identity.id);
     expect(verified!.name).toBe('alice');
   });
 
-  it('should return null for invalid private key', () => {
-    db.createIdentity('alice', 'human');
+  it('should return null for invalid private key', async () => {
+    await db.createIdentity('alice', 'human');
 
     // Random key that doesn't match any identity
     const fakeKey = Buffer.alloc(64);
-    expect(db.verifyIdentity(fakeKey.toString('base64'))).toBeNull();
+    expect(await db.verifyIdentity(fakeKey.toString('base64'))).toBeNull();
   });
 
-  it('should return null for malformed private key', () => {
-    expect(db.verifyIdentity('not-a-valid-key')).toBeNull();
-    expect(db.verifyIdentity('')).toBeNull();
+  it('should return null for malformed private key', async () => {
+    expect(await db.verifyIdentity('not-a-valid-key')).toBeNull();
+    expect(await db.verifyIdentity('')).toBeNull();
   });
 });
 
 // ─── Org CRUD ─────────────────────────────────────────────────────
 
 describe('Org — create', () => {
-  it('should create an org', () => {
-    const org = db.createOrg('acme');
+  it('should create an org', async () => {
+    const org = await db.createOrg('acme');
     expect(org.id).toHaveLength(32);
     expect(org.name).toBe('acme');
     expect(org.created_at).toBeDefined();
   });
 
-  it('should create an org and assign founder as admin', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
+  it('should create an org and assign founder as admin', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
 
     const members = db.listOrgMembers(org.id);
     expect(members).toHaveLength(1);
@@ -231,35 +231,35 @@ describe('Org — create', () => {
     expect(members[0].name).toBe('alice');
   });
 
-  it('should reject empty org name', () => {
-    expect(() => db.createOrg('')).toThrow('Org name cannot be empty');
+  it('should reject empty org name', async () => {
+    await expect(db.createOrg('')).rejects.toThrow('Org name cannot be empty');
   });
 
-  it('should reject duplicate org name', () => {
-    db.createOrg('acme');
-    expect(() => db.createOrg('acme')).toThrow("Org 'acme' already exists");
+  it('should reject duplicate org name', async () => {
+    await db.createOrg('acme');
+    await expect(db.createOrg('acme')).rejects.toThrow("Org 'acme' already exists");
   });
 
-  it('should reject nonexistent founder identity', () => {
-    expect(() => db.createOrg('acme', 'nonexistent')).toThrow("Identity 'nonexistent' not found");
+  it('should reject nonexistent founder identity', async () => {
+    await expect(db.createOrg('acme', 'nonexistent')).rejects.toThrow("Identity 'nonexistent' not found");
   });
 
-  it('should trim whitespace from name', () => {
-    const org = db.createOrg('  acme  ');
+  it('should trim whitespace from name', async () => {
+    const org = await db.createOrg('  acme  ');
     expect(org.name).toBe('acme');
   });
 });
 
 describe('Org — get & list', () => {
-  it('should get org by ID', () => {
-    const org = db.createOrg('acme');
+  it('should get org by ID', async () => {
+    const org = await db.createOrg('acme');
     const found = db.getOrg(org.id);
     expect(found).not.toBeNull();
     expect(found!.name).toBe('acme');
   });
 
-  it('should get org by name', () => {
-    db.createOrg('acme');
+  it('should get org by name', async () => {
+    await db.createOrg('acme');
     const found = db.getOrgByName('acme');
     expect(found).not.toBeNull();
     expect(found!.name).toBe('acme');
@@ -270,10 +270,10 @@ describe('Org — get & list', () => {
     expect(db.getOrgByName('nonexistent')).toBeNull();
   });
 
-  it('should list all orgs in creation order', () => {
-    db.createOrg('acme');
-    db.createOrg('globex');
-    db.createOrg('initech');
+  it('should list all orgs in creation order', async () => {
+    await db.createOrg('acme');
+    await db.createOrg('globex');
+    await db.createOrg('initech');
 
     const orgs = db.listOrgs();
     expect(orgs).toHaveLength(3);
@@ -284,24 +284,24 @@ describe('Org — get & list', () => {
 });
 
 describe('Org — delete', () => {
-  it('should delete an org', () => {
-    const org = db.createOrg('acme');
+  it('should delete an org', async () => {
+    const org = await db.createOrg('acme');
     expect(db.deleteOrg(org.id)).toBe(true);
     expect(db.getOrg(org.id)).toBeNull();
   });
 
-  it('should cascade-delete projects when org is deleted', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
-    const project = db.createProject(org.id, 'my-project', identity.id);
+  it('should cascade-delete projects when org is deleted', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
+    const project = await db.createProject(org.id, 'my-project', identity.id);
 
     db.deleteOrg(org.id);
     expect(db.getProject(project.id)).toBeNull();
   });
 
-  it('should cascade-delete org memberships when org is deleted', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
+  it('should cascade-delete org memberships when org is deleted', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
 
     db.deleteOrg(org.id);
     expect(db.getOrgMember(org.id, identity.id)).toBeNull();
@@ -315,10 +315,10 @@ describe('Org — delete', () => {
 // ─── Org Membership ───────────────────────────────────────────────
 
 describe('Org — membership', () => {
-  it('should add a member to an org', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should add a member to an org', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
 
     db.addOrgMember(org.id, bob.id, 'member');
 
@@ -330,10 +330,10 @@ describe('Org — membership', () => {
     expect(bobMember!.role).toBe('member');
   });
 
-  it('should add a readonly member', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: viewer } = db.createIdentity('viewer', 'agent');
-    const org = db.createOrg('acme', alice.id);
+  it('should add a readonly member', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: viewer } = await db.createIdentity('viewer', 'agent');
+    const org = await db.createOrg('acme', alice.id);
 
     db.addOrgMember(org.id, viewer.id, 'readonly');
 
@@ -341,44 +341,44 @@ describe('Org — membership', () => {
     expect(role).toBe('readonly');
   });
 
-  it('should reject invalid role', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should reject invalid role', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
 
     expect(() => db.addOrgMember(org.id, bob.id, 'superadmin' as MemberRole)).toThrow(
       "Invalid role: 'superadmin'"
     );
   });
 
-  it('should reject adding member to nonexistent org', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
+  it('should reject adding member to nonexistent org', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
     expect(() => db.addOrgMember('nonexistent', alice.id, 'member')).toThrow(
       "Org 'nonexistent' not found"
     );
   });
 
-  it('should reject adding nonexistent identity', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should reject adding nonexistent identity', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', alice.id);
     expect(() => db.addOrgMember(org.id, 'nonexistent', 'member')).toThrow(
       "Identity 'nonexistent' not found"
     );
   });
 
-  it('should reject duplicate membership', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', alice.id); // alice is already admin
+  it('should reject duplicate membership', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', alice.id); // alice is already admin
 
     expect(() => db.addOrgMember(org.id, alice.id, 'member')).toThrow(
       `Identity '${alice.id}' is already a member of org '${org.id}'`
     );
   });
 
-  it('should update member role', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should update member role', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bob.id, 'member');
 
     db.updateOrgMemberRole(org.id, bob.id, 'admin');
@@ -387,44 +387,44 @@ describe('Org — membership', () => {
     expect(role).toBe('admin');
   });
 
-  it('should reject updating role for non-member', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should reject updating role for non-member', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
 
     expect(() => db.updateOrgMemberRole(org.id, bob.id, 'admin')).toThrow(
       `Identity '${bob.id}' is not a member of org '${org.id}'`
     );
   });
 
-  it('should remove a member from an org', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should remove a member from an org', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bob.id, 'member');
 
     expect(db.removeOrgMember(org.id, bob.id)).toBe(true);
     expect(db.getOrgRole(org.id, bob.id)).toBeNull();
   });
 
-  it('should return false when removing non-member', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should return false when removing non-member', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', alice.id);
     expect(db.removeOrgMember(org.id, 'nonexistent')).toBe(false);
   });
 
-  it('should return null role for non-member', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should return null role for non-member', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
 
     expect(db.getOrgRole(org.id, bob.id)).toBeNull();
   });
 
-  it('should list org members with identity details', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bot } = db.createIdentity('ci-bot', 'agent');
-    const org = db.createOrg('acme', alice.id);
+  it('should list org members with identity details', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bot } = await db.createIdentity('ci-bot', 'agent');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bot.id, 'readonly');
 
     const members = db.listOrgMembers(org.id);
@@ -441,10 +441,10 @@ describe('Org — membership', () => {
 // ─── Project CRUD ─────────────────────────────────────────────────
 
 describe('Project — create', () => {
-  it('should create a project within an org', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
-    const project = db.createProject(org.id, 'my-project', identity.id);
+  it('should create a project within an org', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
+    const project = await db.createProject(org.id, 'my-project', identity.id);
 
     expect(project.id).toHaveLength(32);
     expect(project.name).toBe('my-project');
@@ -452,10 +452,10 @@ describe('Project — create', () => {
     expect(project.created_at).toBeDefined();
   });
 
-  it('should assign founder as project admin', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
-    const project = db.createProject(org.id, 'my-project', identity.id);
+  it('should assign founder as project admin', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
+    const project = await db.createProject(org.id, 'my-project', identity.id);
 
     const members = db.listProjectMembers(project.id);
     expect(members).toHaveLength(1);
@@ -463,79 +463,79 @@ describe('Project — create', () => {
     expect(members[0].role).toBe('admin');
   });
 
-  it('should create a project without a founder', () => {
-    const org = db.createOrg('acme');
-    const project = db.createProject(org.id, 'my-project');
+  it('should create a project without a founder', async () => {
+    const org = await db.createOrg('acme');
+    const project = await db.createProject(org.id, 'my-project');
 
     expect(project.name).toBe('my-project');
     expect(db.listProjectMembers(project.id)).toHaveLength(0);
   });
 
-  it('should reject empty project name', () => {
-    const org = db.createOrg('acme');
-    expect(() => db.createProject(org.id, '')).toThrow('Project name cannot be empty');
+  it('should reject empty project name', async () => {
+    const org = await db.createOrg('acme');
+    await expect(db.createProject(org.id, '')).rejects.toThrow('Project name cannot be empty');
   });
 
-  it('should reject project in nonexistent org', () => {
-    expect(() => db.createProject('nonexistent', 'my-project')).toThrow(
+  it('should reject project in nonexistent org', async () => {
+    await expect(db.createProject('nonexistent', 'my-project')).rejects.toThrow(
       "Org 'nonexistent' not found"
     );
   });
 
-  it('should reject duplicate project name within same org', () => {
-    const org = db.createOrg('acme');
-    db.createProject(org.id, 'my-project');
-    expect(() => db.createProject(org.id, 'my-project')).toThrow(
+  it('should reject duplicate project name within same org', async () => {
+    const org = await db.createOrg('acme');
+    await db.createProject(org.id, 'my-project');
+    await expect(db.createProject(org.id, 'my-project')).rejects.toThrow(
       `Project 'my-project' already exists in org '${org.id}'`
     );
   });
 
-  it('should allow same project name in different orgs', () => {
-    const org1 = db.createOrg('acme');
-    const org2 = db.createOrg('globex');
+  it('should allow same project name in different orgs', async () => {
+    const org1 = await db.createOrg('acme');
+    const org2 = await db.createOrg('globex');
 
-    const p1 = db.createProject(org1.id, 'my-project');
-    const p2 = db.createProject(org2.id, 'my-project');
+    const p1 = await db.createProject(org1.id, 'my-project');
+    const p2 = await db.createProject(org2.id, 'my-project');
 
     expect(p1.id).not.toBe(p2.id);
   });
 
-  it('should reject founder who is not an org member', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should reject founder who is not an org member', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
 
-    expect(() => db.createProject(org.id, 'my-project', bob.id)).toThrow(
+    await expect(db.createProject(org.id, 'my-project', bob.id)).rejects.toThrow(
       `Identity '${bob.id}' is not a member of org '${org.id}'`
     );
   });
 
-  it('should reject readonly org member from creating projects', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: viewer } = db.createIdentity('viewer', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should reject readonly org member from creating projects', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: viewer } = await db.createIdentity('viewer', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, viewer.id, 'readonly');
 
-    expect(() => db.createProject(org.id, 'my-project', viewer.id)).toThrow(
+    await expect(db.createProject(org.id, 'my-project', viewer.id)).rejects.toThrow(
       `Identity '${viewer.id}' has readonly role in org and cannot create projects`
     );
   });
 
-  it('should allow member role to create projects', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should allow member role to create projects', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bob.id, 'member');
 
-    const project = db.createProject(org.id, 'bob-project', bob.id);
+    const project = await db.createProject(org.id, 'bob-project', bob.id);
     expect(project.name).toBe('bob-project');
   });
 });
 
 describe('Project — get & list', () => {
-  it('should get project by ID', () => {
-    const org = db.createOrg('acme');
-    const project = db.createProject(org.id, 'my-project');
+  it('should get project by ID', async () => {
+    const org = await db.createOrg('acme');
+    const project = await db.createProject(org.id, 'my-project');
     const found = db.getProject(project.id);
 
     expect(found).not.toBeNull();
@@ -543,9 +543,9 @@ describe('Project — get & list', () => {
     expect(found!.org_id).toBe(org.id);
   });
 
-  it('should get project by name within org', () => {
-    const org = db.createOrg('acme');
-    db.createProject(org.id, 'my-project');
+  it('should get project by name within org', async () => {
+    const org = await db.createOrg('acme');
+    await db.createProject(org.id, 'my-project');
     const found = db.getProjectByName(org.id, 'my-project');
 
     expect(found).not.toBeNull();
@@ -556,11 +556,11 @@ describe('Project — get & list', () => {
     expect(db.getProject('nonexistent')).toBeNull();
   });
 
-  it('should list projects in an org', () => {
-    const org = db.createOrg('acme');
-    db.createProject(org.id, 'alpha');
-    db.createProject(org.id, 'beta');
-    db.createProject(org.id, 'gamma');
+  it('should list projects in an org', async () => {
+    const org = await db.createOrg('acme');
+    await db.createProject(org.id, 'alpha');
+    await db.createProject(org.id, 'beta');
+    await db.createProject(org.id, 'gamma');
 
     const projects = db.listProjects(org.id);
     expect(projects).toHaveLength(3);
@@ -569,11 +569,11 @@ describe('Project — get & list', () => {
     expect(projects[2].name).toBe('gamma');
   });
 
-  it('should not list projects from other orgs', () => {
-    const org1 = db.createOrg('acme');
-    const org2 = db.createOrg('globex');
-    db.createProject(org1.id, 'acme-project');
-    db.createProject(org2.id, 'globex-project');
+  it('should not list projects from other orgs', async () => {
+    const org1 = await db.createOrg('acme');
+    const org2 = await db.createOrg('globex');
+    await db.createProject(org1.id, 'acme-project');
+    await db.createProject(org2.id, 'globex-project');
 
     const acmeProjects = db.listProjects(org1.id);
     expect(acmeProjects).toHaveLength(1);
@@ -582,18 +582,18 @@ describe('Project — get & list', () => {
 });
 
 describe('Project — delete', () => {
-  it('should delete a project', () => {
-    const org = db.createOrg('acme');
-    const project = db.createProject(org.id, 'my-project');
+  it('should delete a project', async () => {
+    const org = await db.createOrg('acme');
+    const project = await db.createProject(org.id, 'my-project');
 
     expect(db.deleteProject(project.id)).toBe(true);
     expect(db.getProject(project.id)).toBeNull();
   });
 
-  it('should cascade-delete project memberships', () => {
-    const { identity } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', identity.id);
-    const project = db.createProject(org.id, 'my-project', identity.id);
+  it('should cascade-delete project memberships', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', identity.id);
+    const project = await db.createProject(org.id, 'my-project', identity.id);
 
     db.deleteProject(project.id);
     expect(db.getProjectMember(project.id, identity.id)).toBeNull();
@@ -607,12 +607,12 @@ describe('Project — delete', () => {
 // ─── Project Membership ──────────────────────────────────────────
 
 describe('Project — membership', () => {
-  it('should add a member to a project', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should add a member to a project', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bob.id, 'member');
-    const project = db.createProject(org.id, 'my-project', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
 
     db.addProjectMember(project.id, bob.id, 'member');
 
@@ -624,62 +624,62 @@ describe('Project — membership', () => {
     expect(bobMember!.role).toBe('member');
   });
 
-  it('should reject adding non-org-member to project', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: outsider } = db.createIdentity('outsider', 'human');
-    const org = db.createOrg('acme', alice.id);
-    const project = db.createProject(org.id, 'my-project', alice.id);
+  it('should reject adding non-org-member to project', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: outsider } = await db.createIdentity('outsider', 'human');
+    const org = await db.createOrg('acme', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
 
     expect(() => db.addProjectMember(project.id, outsider.id, 'member')).toThrow(
       `Identity '${outsider.id}' must be a member of org '${org.id}'`
     );
   });
 
-  it('should reject adding member to nonexistent project', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
+  it('should reject adding member to nonexistent project', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
     expect(() => db.addProjectMember('nonexistent', alice.id, 'member')).toThrow(
       "Project 'nonexistent' not found"
     );
   });
 
-  it('should reject adding nonexistent identity to project', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', alice.id);
-    const project = db.createProject(org.id, 'my-project', alice.id);
+  it('should reject adding nonexistent identity to project', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
 
     expect(() => db.addProjectMember(project.id, 'nonexistent', 'member')).toThrow(
       "Identity 'nonexistent' not found"
     );
   });
 
-  it('should reject duplicate project membership', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', alice.id);
-    const project = db.createProject(org.id, 'my-project', alice.id);
+  it('should reject duplicate project membership', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
 
     expect(() => db.addProjectMember(project.id, alice.id, 'member')).toThrow(
       `Identity '${alice.id}' is already a member of project '${project.id}'`
     );
   });
 
-  it('should reject invalid project role', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should reject invalid project role', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bob.id, 'member');
-    const project = db.createProject(org.id, 'my-project', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
 
     expect(() => db.addProjectMember(project.id, bob.id, 'superadmin' as MemberRole)).toThrow(
       "Invalid role: 'superadmin'"
     );
   });
 
-  it('should update project member role', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should update project member role', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bob.id, 'member');
-    const project = db.createProject(org.id, 'my-project', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
     db.addProjectMember(project.id, bob.id, 'readonly');
 
     db.updateProjectMemberRole(project.id, bob.id, 'admin');
@@ -688,43 +688,43 @@ describe('Project — membership', () => {
     expect(role).toBe('admin');
   });
 
-  it('should reject updating role for non-member', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
-    const project = db.createProject(org.id, 'my-project', alice.id);
+  it('should reject updating role for non-member', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
 
     expect(() => db.updateProjectMemberRole(project.id, bob.id, 'admin')).toThrow(
       `Identity '${bob.id}' is not a member of project '${project.id}'`
     );
   });
 
-  it('should remove a project member', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bob } = db.createIdentity('bob', 'human');
-    const org = db.createOrg('acme', alice.id);
+  it('should remove a project member', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bob } = await db.createIdentity('bob', 'human');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bob.id, 'member');
-    const project = db.createProject(org.id, 'my-project', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
     db.addProjectMember(project.id, bob.id, 'member');
 
     expect(db.removeProjectMember(project.id, bob.id)).toBe(true);
     expect(db.getProjectRole(project.id, bob.id)).toBeNull();
   });
 
-  it('should return false when removing non-member from project', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const org = db.createOrg('acme', alice.id);
-    const project = db.createProject(org.id, 'my-project', alice.id);
+  it('should return false when removing non-member from project', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const org = await db.createOrg('acme', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
 
     expect(db.removeProjectMember(project.id, 'nonexistent')).toBe(false);
   });
 
-  it('should list project members with identity details', () => {
-    const { identity: alice } = db.createIdentity('alice', 'human');
-    const { identity: bot } = db.createIdentity('ci-bot', 'agent');
-    const org = db.createOrg('acme', alice.id);
+  it('should list project members with identity details', async () => {
+    const { identity: alice } = await db.createIdentity('alice', 'human');
+    const { identity: bot } = await db.createIdentity('ci-bot', 'agent');
+    const org = await db.createOrg('acme', alice.id);
     db.addOrgMember(org.id, bot.id, 'member');
-    const project = db.createProject(org.id, 'my-project', alice.id);
+    const project = await db.createProject(org.id, 'my-project', alice.id);
     db.addProjectMember(project.id, bot.id, 'readonly');
 
     const members = db.listProjectMembers(project.id);
@@ -740,14 +740,14 @@ describe('Project — membership', () => {
 // ─── Integration: Full Workflow ────────────────────────────────────
 
 describe('Identity — full workflow', () => {
-  it('should support a complete identity -> org -> project -> membership flow', () => {
+  it('should support a complete identity -> org -> project -> membership flow', async () => {
     // Create identities
-    const admin = db.createIdentity('admin-user', 'human');
-    const dev = db.createIdentity('dev-agent', 'agent');
-    const viewer = db.createIdentity('viewer', 'human');
+    const admin = await db.createIdentity('admin-user', 'human');
+    const dev = await db.createIdentity('dev-agent', 'agent');
+    const viewer = await db.createIdentity('viewer', 'human');
 
     // Create org with admin as founder
-    const org = db.createOrg('my-org', admin.identity.id);
+    const org = await db.createOrg('my-org', admin.identity.id);
 
     // Add members
     db.addOrgMember(org.id, dev.identity.id, 'member');
@@ -760,8 +760,8 @@ describe('Identity — full workflow', () => {
     expect(db.getOrgRole(org.id, viewer.identity.id)).toBe('readonly');
 
     // Create projects
-    const prodProject = db.createProject(org.id, 'production', admin.identity.id);
-    const devProject = db.createProject(org.id, 'development', dev.identity.id);
+    const prodProject = await db.createProject(org.id, 'production', admin.identity.id);
+    const devProject = await db.createProject(org.id, 'development', dev.identity.id);
 
     // Add project members
     db.addProjectMember(prodProject.id, dev.identity.id, 'readonly');
@@ -777,9 +777,9 @@ describe('Identity — full workflow', () => {
     expect(db.getProjectRole(devProject.id, admin.identity.id)).toBe('admin');
 
     // Verify identities with private keys
-    expect(db.verifyIdentity(admin.privateKey)!.id).toBe(admin.identity.id);
-    expect(db.verifyIdentity(dev.privateKey)!.id).toBe(dev.identity.id);
-    expect(db.verifyIdentity(viewer.privateKey)!.id).toBe(viewer.identity.id);
+    expect((await db.verifyIdentity(admin.privateKey))!.id).toBe(admin.identity.id);
+    expect((await db.verifyIdentity(dev.privateKey))!.id).toBe(dev.identity.id);
+    expect((await db.verifyIdentity(viewer.privateKey))!.id).toBe(viewer.identity.id);
 
     // List everything
     expect(db.listIdentities()).toHaveLength(3);
@@ -787,7 +787,7 @@ describe('Identity — full workflow', () => {
     expect(db.listProjects(org.id)).toHaveLength(2);
 
     // Readonly viewer cannot create projects
-    expect(() => db.createProject(org.id, 'viewer-project', viewer.identity.id)).toThrow(
+    await expect(db.createProject(org.id, 'viewer-project', viewer.identity.id)).rejects.toThrow(
       'has readonly role'
     );
   });

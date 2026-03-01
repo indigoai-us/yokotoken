@@ -128,10 +128,10 @@ describe('Server — POST /v1/init with force', () => {
   beforeAll(async () => {
     ({ tmpDir, config } = createTmpConfig());
     // Pre-initialize with a vault
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('old/secret', 'should-be-gone');
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('old/secret', 'should-be-gone');
+    await vault.close();
 
     server = await createVaultServer(config) as http.Server;
   });
@@ -169,10 +169,10 @@ describe('Server — POST /v1/unlock and /v1/lock', () => {
   beforeAll(async () => {
     ({ tmpDir, config } = createTmpConfig());
     // Pre-initialize the vault
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('test/secret', 'my-value');
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('test/secret', 'my-value');
+    await vault.close();
 
     server = await createVaultServer(config) as http.Server;
   });
@@ -270,12 +270,12 @@ describe('Server — GET /v1/status', () => {
 
   beforeAll(async () => {
     ({ tmpDir, config } = createTmpConfig());
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('aws/key', 'AKIA-1234');
-    vault.store('slack/token', 'xoxb-5678');
-    vault.store('github/pat', 'ghp_abcd');
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('aws/key', 'AKIA-1234');
+    await vault.store('slack/token', 'xoxb-5678');
+    await vault.store('github/pat', 'ghp_abcd');
+    await vault.close();
 
     server = await createVaultServer(config) as http.Server;
   });
@@ -374,9 +374,9 @@ describe('Server — auto-lock after idle timeout', () => {
     tmpDir = result.tmpDir;
 
     // Pre-initialize
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
   });
@@ -502,9 +502,9 @@ describe('Server — passphrase security', () => {
 
   beforeAll(async () => {
     ({ tmpDir, config } = createTmpConfig());
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
     server = await createVaultServer(config) as http.Server;
   });
 

@@ -16,10 +16,10 @@ describe('VaultDatabase', () => {
   let tmpDir: string;
   let dbPath: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-test-'));
     dbPath = path.join(tmpDir, 'test-vault.db');
-    db = new VaultDatabase(dbPath);
+    db = await VaultDatabase.open(dbPath);
   });
 
   afterEach(() => {
@@ -160,9 +160,9 @@ describe('VaultDatabase', () => {
       expect(fs.existsSync(dbPath)).toBe(true);
     });
 
-    it('should create parent directories if needed', () => {
+    it('should create parent directories if needed', async () => {
       const deepPath = path.join(tmpDir, 'deep', 'nested', 'vault.db');
-      const deepDb = new VaultDatabase(deepPath);
+      const deepDb = await VaultDatabase.open(deepPath);
       expect(fs.existsSync(deepPath)).toBe(true);
       deepDb.close();
     });

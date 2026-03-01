@@ -147,9 +147,9 @@ program
           if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
         }
 
-        const vault = new VaultEngine(vaultPath);
-        vault.init(passphrase);
-        vault.close();
+        const vault = await VaultEngine.open(vaultPath);
+        await vault.init(passphrase);
+        await vault.close();
 
         process.stderr.write(`Vault initialized at ${vaultPath}\n`);
         process.stderr.write('Start the vault server with: hq-vault serve\n');
@@ -1230,17 +1230,17 @@ program
 
       // Verify the passphrase against the vault before creating the backup
       const { VaultEngine } = await import('./vault.js');
-      const vault = new VaultEngine(vaultPath);
+      const vault = await VaultEngine.open(vaultPath);
       try {
-        vault.unlock(passphrase);
+        await vault.unlock(passphrase);
       } catch {
-        vault.close();
+        await vault.close();
         process.stderr.write('Error: Invalid passphrase\n');
         process.exit(1);
       }
-      vault.close();
+      await vault.close();
 
-      const result = createBackup(vaultPath, filepath, passphrase);
+      const result = await createBackup(vaultPath, filepath, passphrase);
       process.stderr.write(`Backup created: ${result.filepath}\n`);
       process.stderr.write(`Size: ${result.sizeBytes} bytes\n`);
       process.stderr.write('The backup is fully encrypted and safe to store in cloud storage or git.\n');
@@ -1283,7 +1283,7 @@ program
         process.exit(1);
       }
 
-      const result = restoreBackup(filepath, restorePath, passphrase);
+      const result = await restoreBackup(filepath, restorePath, passphrase);
       process.stderr.write(`Vault restored to: ${result.restoredPath}\n`);
       process.stderr.write(`Secrets: ${result.secretCount}\n`);
       process.stderr.write('Start the vault server with: hq-vault serve\n');
@@ -1402,10 +1402,10 @@ program
         }
 
         const { VaultEngine } = await import('./vault.js');
-        const vault = new VaultEngine(vaultPath);
+        const vault = await VaultEngine.open(vaultPath);
         try {
-          vault.unlock(passphrase);
-          const result = exportEnv(vault, opts.prefix);
+          await vault.unlock(passphrase);
+          const result = await exportEnv(vault, opts.prefix);
 
           if (result.entryCount === 0) {
             process.stderr.write('No secrets to export.\n');
@@ -1420,7 +1420,7 @@ program
             process.stderr.write(`\nExported ${result.entryCount} secret(s).\n`);
           }
         } finally {
-          vault.close();
+          await vault.close();
         }
       }
     } catch (err) {
@@ -1581,12 +1581,12 @@ program
         }
 
         const { VaultEngine } = await import('./vault.js');
-        const vault = new VaultEngine(vaultPath);
+        const vault = await VaultEngine.open(vaultPath);
         try {
-          vault.unlock(passphrase);
+          await vault.unlock(passphrase);
 
           // Detect duplicates and warn
-          const duplicates = detectImportDuplicates(vault, envContent, opts.prefix);
+          const duplicates = await detectImportDuplicates(vault, envContent, opts.prefix);
           if (duplicates.length > 0) {
             process.stderr.write(`\nWarning: ${duplicates.length} duplicate path(s) detected:\n`);
             for (const d of duplicates) {
@@ -1595,7 +1595,7 @@ program
             process.stderr.write(`Conflict strategy: ${strategy}\n\n`);
           }
 
-          const result = importEnv(vault, envContent, strategy, opts.prefix);
+          const result = await importEnv(vault, envContent, strategy, opts.prefix);
 
           process.stderr.write(`Import complete: ${result.imported} imported, ${result.skipped} skipped, ${result.overwritten} overwritten, ${result.renamed} renamed\n`);
           if (result.errors.length > 0) {
@@ -1606,7 +1606,7 @@ program
             process.exit(1);
           }
         } finally {
-          vault.close();
+          await vault.close();
         }
       }
     } catch (err) {
@@ -1630,10 +1630,10 @@ identityCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        const result = idb.createIdentity(opts.name, opts.type);
+        const result = await idb.createIdentity(opts.name, opts.type);
 
         // Audit: log identity creation (US-007)
         const auditLogger = new AuditLogger();
@@ -1674,7 +1674,7 @@ identityCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const identities = idb.listIdentities();
@@ -1718,10 +1718,10 @@ identityCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        const identity = idb.verifyIdentity(opts.key);
+        const identity = await idb.verifyIdentity(opts.key);
         if (identity) {
           process.stdout.write(`Identity verified:\n`);
           process.stdout.write(`  ID:   ${identity.id}\n`);
@@ -1751,7 +1751,7 @@ identityCmd
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const { parseDuration } = await import('./vault.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         // Look up identity by name
@@ -1772,7 +1772,7 @@ identityCmd
           gracePeriodMs = parsed;
         }
 
-        const result = idb.rotateKey(identity.id, gracePeriodMs);
+        const result = await idb.rotateKey(identity.id, gracePeriodMs);
 
         // Audit: log key rotation
         const auditLogger = new AuditLogger();
@@ -1823,10 +1823,10 @@ orgCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        const org = idb.createOrg(opts.name, opts.identity);
+        const org = await idb.createOrg(opts.name, opts.identity);
 
         // Audit: log org creation (US-007)
         const founderIdentity = opts.identity ? idb.getIdentity(opts.identity) : null;
@@ -1865,7 +1865,7 @@ orgCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const orgs = idb.listOrgs();
@@ -1911,7 +1911,7 @@ orgCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         idb.addOrgMember(opts.org, opts.identity, opts.role);
@@ -1950,7 +1950,7 @@ orgCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const members = idb.listOrgMembers(opts.org);
@@ -2001,10 +2001,10 @@ projectCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        const project = idb.createProject(opts.org, opts.name, opts.identity);
+        const project = await idb.createProject(opts.org, opts.name, opts.identity);
 
         // Audit: log project creation (US-007)
         const orgRecord = idb.getOrg(opts.org);
@@ -2047,7 +2047,7 @@ projectCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const projects = idb.listProjects(opts.org);
@@ -2093,7 +2093,7 @@ projectCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         idb.addProjectMember(opts.project, opts.identity, opts.role);
@@ -2134,7 +2134,7 @@ projectCmd
     try {
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const members = idb.listProjectMembers(opts.project);
@@ -2295,7 +2295,7 @@ authCmd
       // Look up the identity by name in the identity database
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       let identityId: string;
       let publicKeyBase64: string;
@@ -2308,14 +2308,14 @@ authCmd
         identityId = identity.id;
 
         // Extract public key from private key using sodium
-        const sodium = (await import('sodium-native')).default;
+        const sodium = (await import('libsodium-wrappers-sumo')).default;
+        await sodium.ready;
         const secretKey = Buffer.from(privateKeyBase64, 'base64');
         if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
           process.stderr.write(`Error: Invalid private key length\n`);
           process.exit(1);
         }
-        const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-        sodium.crypto_sign_ed25519_sk_to_pk(publicKey, secretKey);
+        const publicKey = Buffer.from(sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(secretKey)));
         publicKeyBase64 = publicKey.toString('base64');
 
         // Step 1: Request a challenge
@@ -2336,11 +2336,11 @@ authCmd
 
         // Step 2: Sign the challenge nonce
         const { ed25519Sign } = await import('./network-auth.js');
-        const signature = ed25519Sign(challengeNonce, secretKey);
+        const signature = await ed25519Sign(challengeNonce, secretKey);
         const signatureBase64url = signature.toString('base64url');
 
         // Zero out the secret key
-        sodium.sodium_memzero(secretKey);
+        sodium.memzero(secretKey);
 
         // Step 3: Verify the signature and get a session token
         const verifyRes = await request(
@@ -2408,7 +2408,7 @@ accessRequestsCmd
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const { AccessRequestManager } = await import('./access-requests.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const arm = new AccessRequestManager(idb);
@@ -2463,7 +2463,7 @@ accessRequestsCmd
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const { AccessRequestManager } = await import('./access-requests.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const arm = new AccessRequestManager(idb);
@@ -2512,7 +2512,7 @@ accessRequestsCmd
       const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
       const { AccessRequestManager } = await import('./access-requests.js');
       const dbPath = opts.identityDb || getDefaultIdentityDbPath();
-      const idb = new IdentityDatabase(dbPath);
+      const idb = await IdentityDatabase.open(dbPath);
 
       try {
         const arm = new AccessRequestManager(idb);

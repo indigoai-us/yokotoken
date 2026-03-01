@@ -27,10 +27,10 @@ import { request, type ClientConfig } from '../src/client.js';
 let tmpDir: string;
 let db: IdentityDatabase;
 
-function createTestDb(): { db: IdentityDatabase; tmpDir: string } {
+async function createTestDb(): Promise<{ db: IdentityDatabase; tmpDir: string }> {
   const td = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-access-req-'));
   const dbPath = path.join(td, 'identity.db');
-  const identityDb = new IdentityDatabase(dbPath);
+  const identityDb = await IdentityDatabase.open(dbPath);
   return { db: identityDb, tmpDir: td };
 }
 
@@ -46,13 +46,13 @@ function cleanupTestDb(): void {
 /**
  * Set up a basic test scenario with an identity, org, and project.
  */
-function setupScenario(identityDb: IdentityDatabase) {
-  const identity = identityDb.createIdentity('test-agent', 'agent');
-  const org = identityDb.createOrg('acme-corp');
-  const project = identityDb.createProject(org.id, 'secret-project', undefined);
+async function setupScenario(identityDb: IdentityDatabase) {
+  const identity = await identityDb.createIdentity('test-agent', 'agent');
+  const org = await identityDb.createOrg('acme-corp');
+  const project = await identityDb.createProject(org.id, 'secret-project', undefined);
 
   // We need an admin identity for the org to add project members later
-  const admin = identityDb.createIdentity('admin-user', 'human');
+  const admin = await identityDb.createIdentity('admin-user', 'human');
   identityDb.addOrgMember(org.id, admin.identity.id, 'admin');
 
   return { identity, org, project, admin };
@@ -61,8 +61,8 @@ function setupScenario(identityDb: IdentityDatabase) {
 // ─── Unit Tests: AccessRequestManager ─────────────────────────────
 
 describe('AccessRequestManager — createRequest', () => {
-  beforeEach(() => {
-    const result = createTestDb();
+  beforeEach(async () => {
+    const result = await createTestDb();
     db = result.db;
     tmpDir = result.tmpDir;
   });
@@ -71,8 +71,8 @@ describe('AccessRequestManager — createRequest', () => {
     cleanupTestDb();
   });
 
-  it('should create a valid access request for an org', () => {
-    const { identity, org } = setupScenario(db);
+  it('should create a valid access request for an org', async () => {
+    const { identity, org } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -96,8 +96,8 @@ describe('AccessRequestManager — createRequest', () => {
     expect(req.created_at).toBeDefined();
   });
 
-  it('should create a valid access request for an org + project', () => {
-    const { identity, org, project } = setupScenario(db);
+  it('should create a valid access request for an org + project', async () => {
+    const { identity, org, project } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -113,8 +113,8 @@ describe('AccessRequestManager — createRequest', () => {
     expect(req.status).toBe('pending');
   });
 
-  it('should reject request with non-existent identity', () => {
-    setupScenario(db);
+  it('should reject request with non-existent identity', async () => {
+    await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     expect(() =>
@@ -127,8 +127,8 @@ describe('AccessRequestManager — createRequest', () => {
     ).toThrow("Identity 'nonexistent' not found");
   });
 
-  it('should reject request with non-existent org', () => {
-    const { identity } = setupScenario(db);
+  it('should reject request with non-existent org', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     expect(() =>
@@ -141,8 +141,8 @@ describe('AccessRequestManager — createRequest', () => {
     ).toThrow("Org 'no-such-org' not found");
   });
 
-  it('should reject request with non-existent project', () => {
-    const { identity } = setupScenario(db);
+  it('should reject request with non-existent project', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     expect(() =>
@@ -156,8 +156,8 @@ describe('AccessRequestManager — createRequest', () => {
     ).toThrow("Project 'no-such-project' not found in org 'acme-corp'");
   });
 
-  it('should reject request with invalid role', () => {
-    const { identity } = setupScenario(db);
+  it('should reject request with invalid role', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     expect(() =>
@@ -170,8 +170,8 @@ describe('AccessRequestManager — createRequest', () => {
     ).toThrow("Invalid role: 'superadmin'");
   });
 
-  it('should reject request with empty justification', () => {
-    const { identity } = setupScenario(db);
+  it('should reject request with empty justification', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     expect(() =>
@@ -184,8 +184,8 @@ describe('AccessRequestManager — createRequest', () => {
     ).toThrow('Justification cannot be empty');
   });
 
-  it('should reject duplicate pending request for same identity/org', () => {
-    const { identity } = setupScenario(db);
+  it('should reject duplicate pending request for same identity/org', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     arm.createRequest({
@@ -205,8 +205,8 @@ describe('AccessRequestManager — createRequest', () => {
     ).toThrow('A pending access request already exists');
   });
 
-  it('should allow duplicate after first request is approved', () => {
-    const { identity } = setupScenario(db);
+  it('should allow duplicate after first request is approved', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const first = arm.createRequest({
@@ -230,8 +230,8 @@ describe('AccessRequestManager — createRequest', () => {
     expect(second.status).toBe('pending');
   });
 
-  it('should allow duplicate after first request is denied', () => {
-    const { identity } = setupScenario(db);
+  it('should allow duplicate after first request is denied', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const first = arm.createRequest({
@@ -254,10 +254,10 @@ describe('AccessRequestManager — createRequest', () => {
     expect(second.status).toBe('pending');
   });
 
-  it('should allow different project requests for same org', () => {
-    const { identity, org } = setupScenario(db);
+  it('should allow different project requests for same org', async () => {
+    const { identity, org } = await setupScenario(db);
     // Create a second project
-    db.createProject(org.id, 'other-project', undefined);
+    await db.createProject(org.id, 'other-project', undefined);
     const arm = new AccessRequestManager(db);
 
     const r1 = arm.createRequest({
@@ -281,8 +281,8 @@ describe('AccessRequestManager — createRequest', () => {
 });
 
 describe('AccessRequestManager — getRequest', () => {
-  beforeEach(() => {
-    const result = createTestDb();
+  beforeEach(async () => {
+    const result = await createTestDb();
     db = result.db;
     tmpDir = result.tmpDir;
   });
@@ -291,8 +291,8 @@ describe('AccessRequestManager — getRequest', () => {
     cleanupTestDb();
   });
 
-  it('should retrieve a request by ID', () => {
-    const { identity } = setupScenario(db);
+  it('should retrieve a request by ID', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const created = arm.createRequest({
@@ -308,8 +308,8 @@ describe('AccessRequestManager — getRequest', () => {
     expect(fetched!.status).toBe('pending');
   });
 
-  it('should return null for non-existent request', () => {
-    setupScenario(db);
+  it('should return null for non-existent request', async () => {
+    await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const result = arm.getRequest('nonexistent');
@@ -318,8 +318,8 @@ describe('AccessRequestManager — getRequest', () => {
 });
 
 describe('AccessRequestManager — listRequests', () => {
-  beforeEach(() => {
-    const result = createTestDb();
+  beforeEach(async () => {
+    const result = await createTestDb();
     db = result.db;
     tmpDir = result.tmpDir;
   });
@@ -328,9 +328,9 @@ describe('AccessRequestManager — listRequests', () => {
     cleanupTestDb();
   });
 
-  it('should list all requests', () => {
-    const { identity } = setupScenario(db);
-    const identity2 = db.createIdentity('agent-2', 'agent');
+  it('should list all requests', async () => {
+    const { identity } = await setupScenario(db);
+    const identity2 = await db.createIdentity('agent-2', 'agent');
     const arm = new AccessRequestManager(db);
 
     arm.createRequest({
@@ -351,9 +351,9 @@ describe('AccessRequestManager — listRequests', () => {
     expect(all.length).toBe(2);
   });
 
-  it('should filter by org', () => {
-    const { identity } = setupScenario(db);
-    const org2 = db.createOrg('other-corp');
+  it('should filter by org', async () => {
+    const { identity } = await setupScenario(db);
+    const org2 = await db.createOrg('other-corp');
     const arm = new AccessRequestManager(db);
 
     arm.createRequest({
@@ -364,7 +364,7 @@ describe('AccessRequestManager — listRequests', () => {
     });
 
     // Create a request for a different org (need a second identity to avoid duplicate detection)
-    const identity2 = db.createIdentity('agent-2', 'agent');
+    const identity2 = await db.createIdentity('agent-2', 'agent');
     arm.createRequest({
       identity_id: identity2.identity.id,
       org: 'other-corp',
@@ -377,9 +377,9 @@ describe('AccessRequestManager — listRequests', () => {
     expect(filtered[0].org).toBe('acme-corp');
   });
 
-  it('should filter by status', () => {
-    const { identity } = setupScenario(db);
-    const identity2 = db.createIdentity('agent-2', 'agent');
+  it('should filter by status', async () => {
+    const { identity } = await setupScenario(db);
+    const identity2 = await db.createIdentity('agent-2', 'agent');
     const arm = new AccessRequestManager(db);
 
     const r1 = arm.createRequest({
@@ -408,8 +408,8 @@ describe('AccessRequestManager — listRequests', () => {
 });
 
 describe('AccessRequestManager — approveRequest', () => {
-  beforeEach(() => {
-    const result = createTestDb();
+  beforeEach(async () => {
+    const result = await createTestDb();
     db = result.db;
     tmpDir = result.tmpDir;
   });
@@ -418,8 +418,8 @@ describe('AccessRequestManager — approveRequest', () => {
     cleanupTestDb();
   });
 
-  it('should approve a request and create org membership', () => {
-    const { identity, org } = setupScenario(db);
+  it('should approve a request and create org membership', async () => {
+    const { identity, org } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -441,8 +441,8 @@ describe('AccessRequestManager — approveRequest', () => {
     expect(orgMember!.role).toBe('member');
   });
 
-  it('should approve a request and create both org and project membership', () => {
-    const { identity, org, project } = setupScenario(db);
+  it('should approve a request and create both org and project membership', async () => {
+    const { identity, org, project } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -468,8 +468,8 @@ describe('AccessRequestManager — approveRequest', () => {
     expect(projectMember!.role).toBe('readonly');
   });
 
-  it('should reject approval of non-existent request', () => {
-    setupScenario(db);
+  it('should reject approval of non-existent request', async () => {
+    await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     expect(() =>
@@ -477,8 +477,8 @@ describe('AccessRequestManager — approveRequest', () => {
     ).toThrow("Access request 'nonexistent' not found");
   });
 
-  it('should reject approval of already approved request', () => {
-    const { identity } = setupScenario(db);
+  it('should reject approval of already approved request', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -495,8 +495,8 @@ describe('AccessRequestManager — approveRequest', () => {
     ).toThrow('is already approved');
   });
 
-  it('should reject approval of already denied request', () => {
-    const { identity } = setupScenario(db);
+  it('should reject approval of already denied request', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -513,8 +513,8 @@ describe('AccessRequestManager — approveRequest', () => {
     ).toThrow('is already denied');
   });
 
-  it('should skip org membership creation if already a member', () => {
-    const { identity, org } = setupScenario(db);
+  it('should skip org membership creation if already a member', async () => {
+    const { identity, org } = await setupScenario(db);
     // Pre-add as org member
     db.addOrgMember(org.id, identity.identity.id, 'readonly');
 
@@ -538,8 +538,8 @@ describe('AccessRequestManager — approveRequest', () => {
 });
 
 describe('AccessRequestManager — denyRequest', () => {
-  beforeEach(() => {
-    const result = createTestDb();
+  beforeEach(async () => {
+    const result = await createTestDb();
     db = result.db;
     tmpDir = result.tmpDir;
   });
@@ -548,8 +548,8 @@ describe('AccessRequestManager — denyRequest', () => {
     cleanupTestDb();
   });
 
-  it('should deny a request without reason', () => {
-    const { identity } = setupScenario(db);
+  it('should deny a request without reason', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -567,8 +567,8 @@ describe('AccessRequestManager — denyRequest', () => {
     expect(result.denial_reason).toBeNull();
   });
 
-  it('should deny a request with reason', () => {
-    const { identity } = setupScenario(db);
+  it('should deny a request with reason', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -584,8 +584,8 @@ describe('AccessRequestManager — denyRequest', () => {
     expect(result.denial_reason).toBe('Admin access not available for agents');
   });
 
-  it('should reject denial of non-existent request', () => {
-    setupScenario(db);
+  it('should reject denial of non-existent request', async () => {
+    await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     expect(() =>
@@ -593,8 +593,8 @@ describe('AccessRequestManager — denyRequest', () => {
     ).toThrow("Access request 'nonexistent' not found");
   });
 
-  it('should reject denial of already processed request', () => {
-    const { identity } = setupScenario(db);
+  it('should reject denial of already processed request', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -613,8 +613,8 @@ describe('AccessRequestManager — denyRequest', () => {
 });
 
 describe('AccessRequestManager — expiry', () => {
-  beforeEach(() => {
-    const result = createTestDb();
+  beforeEach(async () => {
+    const result = await createTestDb();
     db = result.db;
     tmpDir = result.tmpDir;
   });
@@ -623,8 +623,8 @@ describe('AccessRequestManager — expiry', () => {
     cleanupTestDb();
   });
 
-  it('should detect expired requests', () => {
-    const { identity } = setupScenario(db);
+  it('should detect expired requests', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -637,16 +637,17 @@ describe('AccessRequestManager — expiry', () => {
     // Manually set created_at to 25 hours ago
     const pastDate = new Date(Date.now() - (REQUEST_EXPIRY_HOURS + 1) * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
     // Access the private db to update
-    (db as any).db.prepare(
-      'UPDATE access_requests SET created_at = ? WHERE request_id = ?'
-    ).run(pastDate, req.request_id);
+    (db as any).db.run(
+      'UPDATE access_requests SET created_at = ? WHERE request_id = ?',
+      [pastDate, req.request_id],
+    );
 
     const updatedReq = arm.getRequest(req.request_id)!;
     expect(arm.isExpired(updatedReq)).toBe(true);
   });
 
-  it('should not detect fresh requests as expired', () => {
-    const { identity } = setupScenario(db);
+  it('should not detect fresh requests as expired', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -659,8 +660,8 @@ describe('AccessRequestManager — expiry', () => {
     expect(arm.isExpired(req)).toBe(false);
   });
 
-  it('should clean expired pending requests', () => {
-    const { identity } = setupScenario(db);
+  it('should clean expired pending requests', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -672,9 +673,10 @@ describe('AccessRequestManager — expiry', () => {
 
     // Set to 25 hours ago
     const pastDate = new Date(Date.now() - (REQUEST_EXPIRY_HOURS + 1) * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
-    (db as any).db.prepare(
-      'UPDATE access_requests SET created_at = ? WHERE request_id = ?'
-    ).run(pastDate, req.request_id);
+    (db as any).db.run(
+      'UPDATE access_requests SET created_at = ? WHERE request_id = ?',
+      [pastDate, req.request_id],
+    );
 
     const cleaned = arm.cleanExpired();
     expect(cleaned).toBe(1);
@@ -684,8 +686,8 @@ describe('AccessRequestManager — expiry', () => {
     expect(updated.denial_reason).toContain('Expired');
   });
 
-  it('should reject approval of expired request', () => {
-    const { identity } = setupScenario(db);
+  it('should reject approval of expired request', async () => {
+    const { identity } = await setupScenario(db);
     const arm = new AccessRequestManager(db);
 
     const req = arm.createRequest({
@@ -697,9 +699,10 @@ describe('AccessRequestManager — expiry', () => {
 
     // Set to 25 hours ago
     const pastDate = new Date(Date.now() - (REQUEST_EXPIRY_HOURS + 1) * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
-    (db as any).db.prepare(
-      'UPDATE access_requests SET created_at = ? WHERE request_id = ?'
-    ).run(pastDate, req.request_id);
+    (db as any).db.run(
+      'UPDATE access_requests SET created_at = ? WHERE request_id = ?',
+      [pastDate, req.request_id],
+    );
 
     expect(() =>
       arm.approveRequest(req.request_id, 'admin')
@@ -723,11 +726,15 @@ describe('Access request server endpoints', () => {
     // Set up identity database
     identityTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-ar-id-'));
     const identityDbPath = path.join(identityTmpDir, 'identity.db');
-    identityDb = new IdentityDatabase(identityDbPath);
+    identityDb = await IdentityDatabase.open(identityDbPath);
 
-    // Create test data
-    const identity = identityDb.createIdentity('server-test-agent', 'agent');
-    const org = identityDb.createOrg('test-org');
+    // Create test data — all identities must be created before server starts
+    // because the server loads its own in-memory copy of the identity DB
+    const identity = await identityDb.createIdentity('server-test-agent', 'agent');
+    await identityDb.createIdentity('poll-test-agent', 'agent');
+    await identityDb.createIdentity('no-auth-agent', 'agent');
+    await identityDb.createIdentity('no-auth-poll-agent', 'agent');
+    const org = await identityDb.createOrg('test-org');
 
     // Start test server
     serverTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-ar-srv-'));
@@ -830,17 +837,15 @@ describe('Access request server endpoints', () => {
   });
 
   it('GET /v1/access-requests/:id — should poll request status', async () => {
-    const identity = identityDb.getIdentityByName('server-test-agent')!;
-
-    // Create a fresh request (need a new identity to avoid duplicate)
-    const newIdentity = identityDb.createIdentity('poll-test-agent', 'agent');
+    // Use pre-created identity (created in beforeAll before server startup)
+    const pollIdentity = identityDb.getIdentityByName('poll-test-agent')!;
 
     const createRes = await request(
       clientConfig,
       'POST',
       '/v1/access-requests',
       {
-        identity_id: newIdentity.identity.id,
+        identity_id: pollIdentity.id,
         org: 'test-org',
         role_requested: 'readonly',
         justification: 'Polling test',
@@ -860,7 +865,7 @@ describe('Access request server endpoints', () => {
     expect(pollRes.statusCode).toBe(200);
     expect(pollRes.body.request_id).toBe(requestId);
     expect(pollRes.body.status).toBe('pending');
-    expect(pollRes.body.identity_id).toBe(newIdentity.identity.id);
+    expect(pollRes.body.identity_id).toBe(pollIdentity.id);
     expect(pollRes.body.org).toBe('test-org');
     expect(pollRes.body.justification).toBe('Polling test');
   });
@@ -879,14 +884,14 @@ describe('Access request server endpoints', () => {
   it('POST /v1/access-requests — no auth required', async () => {
     // This test verifies that the endpoint works WITHOUT a Bearer token
     // (agents need this before they have access)
-    const newIdentity = identityDb.createIdentity('no-auth-agent', 'agent');
+    const noAuthIdentity = identityDb.getIdentityByName('no-auth-agent')!;
 
     const res = await request(
       { ...clientConfig, token: undefined },
       'POST',
       '/v1/access-requests',
       {
-        identity_id: newIdentity.identity.id,
+        identity_id: noAuthIdentity.id,
         org: 'test-org',
         role_requested: 'member',
         justification: 'No auth needed for access requests',
@@ -898,14 +903,14 @@ describe('Access request server endpoints', () => {
   });
 
   it('GET /v1/access-requests/:id — no auth required', async () => {
-    const newIdentity = identityDb.createIdentity('no-auth-poll-agent', 'agent');
+    const noAuthPollIdentity = identityDb.getIdentityByName('no-auth-poll-agent')!;
 
     const createRes = await request(
       { ...clientConfig, token: undefined },
       'POST',
       '/v1/access-requests',
       {
-        identity_id: newIdentity.identity.id,
+        identity_id: noAuthPollIdentity.id,
         org: 'test-org',
         role_requested: 'member',
         justification: 'test',

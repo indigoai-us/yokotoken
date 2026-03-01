@@ -9,13 +9,16 @@
  *
  * Uses a SEPARATE SQLite database (identity.db) from the vault secrets database.
  * Private keys are NEVER stored — only the public key hash is persisted.
+ *
+ * Uses sql.js (WASM) and libsodium-wrappers-sumo (WASM) for portability.
  */
 
-import Database from 'better-sqlite3';
-import sodium from 'sodium-native';
+import initSqlJs, { type Database as SqlJsDatabase } from 'sql.js';
+import sodium from 'libsodium-wrappers-sumo';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
+import { ensureSodium } from './crypto.js';
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -84,30 +87,78 @@ export interface IdentityCreateResult {
 const VALID_IDENTITY_TYPES: IdentityType[] = ['human', 'agent'];
 const VALID_ROLES: MemberRole[] = ['admin', 'member', 'readonly'];
 
+/** Cached sql.js SQL module (loaded once). */
+let sqlJsModule: Awaited<ReturnType<typeof initSqlJs>> | null = null;
+
+async function getSqlJs() {
+  if (!sqlJsModule) {
+    sqlJsModule = await initSqlJs();
+  }
+  return sqlJsModule;
+}
+
 // ─── IdentityDatabase ───────────────────────────────────────────────
 
 export class IdentityDatabase {
-  private db: Database.Database;
+  private db: SqlJsDatabase;
+  private dbPath: string;
 
-  constructor(dbPath: string) {
+  /** Use IdentityDatabase.open(dbPath) instead of constructor. */
+  private constructor(db: SqlJsDatabase, dbPath: string) {
+    this.db = db;
+    this.dbPath = dbPath;
+  }
+
+  /**
+   * Open or create an identity database at the given path.
+   */
+  static async open(dbPath: string): Promise<IdentityDatabase> {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    this.db = new Database(dbPath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
+    const SQL = await getSqlJs();
 
-    this.initSchema();
-    this.migrateSchema();
+    let db: SqlJsDatabase;
+    if (fs.existsSync(dbPath)) {
+      const fileBuffer = fs.readFileSync(dbPath);
+      db = new SQL.Database(fileBuffer);
+    } else {
+      db = new SQL.Database();
+    }
+
+    db.run('PRAGMA foreign_keys = ON');
+
+    const instance = new IdentityDatabase(db, dbPath);
+    instance.initSchema();
+    instance.migrateSchema();
+
+    // Re-enable foreign keys after schema init — sql.js multi-statement
+    // db.run() can reset connection-level PRAGMAs.
+    db.run('PRAGMA foreign_keys = ON');
+
+    instance.save();
+    return instance;
+  }
+
+  /**
+   * Persist to disk.
+   *
+   * Note: sql.js `db.export()` resets connection-level PRAGMAs (including
+   * foreign_keys) as a side-effect, so we re-enable foreign keys after export.
+   */
+  private save(): void {
+    const data = this.db.export();
+    fs.writeFileSync(this.dbPath, Buffer.from(data));
+    this.db.run('PRAGMA foreign_keys = ON');
   }
 
   /**
    * Initialize identity database schema.
    */
   private initSchema(): void {
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS identities (
         id                   TEXT PRIMARY KEY,
         name                 TEXT NOT NULL,
@@ -158,15 +209,19 @@ export class IdentityDatabase {
    * Migrate schema for existing databases (add columns if missing).
    */
   private migrateSchema(): void {
-    // Check if old_public_key_hash column exists
-    const columns = this.db.pragma('table_info(identities)') as Array<{ name: string }>;
-    const columnNames = columns.map(c => c.name);
-
-    if (!columnNames.includes('old_public_key_hash')) {
-      this.db.exec(`ALTER TABLE identities ADD COLUMN old_public_key_hash TEXT`);
+    const colNames = new Set<string>();
+    const stmt = this.db.prepare('PRAGMA table_info(identities)');
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      colNames.add(row.name as string);
     }
-    if (!columnNames.includes('old_key_expires_at')) {
-      this.db.exec(`ALTER TABLE identities ADD COLUMN old_key_expires_at TEXT`);
+    stmt.free();
+
+    if (!colNames.has('old_public_key_hash')) {
+      this.db.run(`ALTER TABLE identities ADD COLUMN old_public_key_hash TEXT`);
+    }
+    if (!colNames.has('old_key_expires_at')) {
+      this.db.run(`ALTER TABLE identities ADD COLUMN old_key_expires_at TEXT`);
     }
   }
 
@@ -178,7 +233,7 @@ export class IdentityDatabase {
    * Generates a keypair, stores the public key hash, and returns
    * the private key for one-time display. The private key is NEVER stored.
    */
-  createIdentity(name: string, type: IdentityType): IdentityCreateResult {
+  async createIdentity(name: string, type: IdentityType): Promise<IdentityCreateResult> {
     if (!name || name.trim().length === 0) {
       throw new Error('Identity name cannot be empty');
     }
@@ -186,10 +241,12 @@ export class IdentityDatabase {
       throw new Error(`Invalid identity type: '${type}'. Must be 'human' or 'agent'`);
     }
 
-    // Generate Ed25519 keypair using sodium-native
-    const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    const secretKey = Buffer.alloc(sodium.crypto_sign_SECRETKEYBYTES);
-    sodium.crypto_sign_keypair(publicKey, secretKey);
+    await ensureSodium();
+
+    // Generate Ed25519 keypair using libsodium-wrappers-sumo
+    const keypair = sodium.crypto_sign_keypair();
+    const publicKey = Buffer.from(keypair.publicKey);
+    const secretKey = Buffer.from(keypair.privateKey);
 
     // Hash the public key for storage (SHA-256 hex)
     const publicKeyHash = crypto
@@ -197,12 +254,14 @@ export class IdentityDatabase {
       .update(publicKey)
       .digest('hex');
 
-    const id = generateId();
+    const id = await generateId();
 
-    this.db.prepare(`
-      INSERT INTO identities (id, name, type, public_key_hash)
-      VALUES (?, ?, ?, ?)
-    `).run(id, name.trim(), type, publicKeyHash);
+    this.db.run(
+      `INSERT INTO identities (id, name, type, public_key_hash)
+      VALUES (?, ?, ?, ?)`,
+      [id, name.trim(), type, publicKeyHash],
+    );
+    this.save();
 
     const identity = this.getIdentity(id)!;
 
@@ -213,7 +272,7 @@ export class IdentityDatabase {
     };
 
     // Zero out the secret key buffer after copying to base64
-    sodium.sodium_memzero(secretKey);
+    sodium.memzero(secretKey);
 
     return result;
   }
@@ -222,67 +281,75 @@ export class IdentityDatabase {
    * Get an identity by ID.
    */
   getIdentity(id: string): Identity | null {
-    const row = this.db.prepare(
-      'SELECT * FROM identities WHERE id = ?'
-    ).get(id) as Identity | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM identities WHERE id = ?');
+    stmt.bind([id]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return this.toIdentity(row);
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * Get an identity by name.
    */
   getIdentityByName(name: string): Identity | null {
-    const row = this.db.prepare(
-      'SELECT * FROM identities WHERE name = ?'
-    ).get(name) as Identity | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM identities WHERE name = ?');
+    stmt.bind([name]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return this.toIdentity(row);
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * List all identities.
    */
   listIdentities(): Identity[] {
-    return this.db.prepare(
-      'SELECT * FROM identities ORDER BY created_at'
-    ).all() as Identity[];
+    const results: Identity[] = [];
+    const stmt = this.db.prepare('SELECT * FROM identities ORDER BY created_at');
+    while (stmt.step()) {
+      results.push(this.toIdentity(stmt.getAsObject()));
+    }
+    stmt.free();
+    return results;
   }
 
   /**
    * Delete an identity by ID. Also removes all memberships (via CASCADE).
    */
   deleteIdentity(id: string): boolean {
-    const result = this.db.prepare(
-      'DELETE FROM identities WHERE id = ?'
-    ).run(id);
-    return result.changes > 0;
+    const exists = this.getIdentity(id);
+    if (!exists) return false;
+    this.db.run('DELETE FROM identities WHERE id = ?', [id]);
+    this.save();
+    return true;
   }
 
   // ─── Key Rotation ──────────────────────────────────────────────
 
   /**
    * Rotate an identity's Ed25519 keypair.
-   *
-   * Generates a new keypair, updates the stored public key hash, and optionally
-   * keeps the old key valid for a grace period. The new private key is returned
-   * ONCE and never stored.
-   *
-   * @param identityId - The identity whose key to rotate.
-   * @param gracePeriodMs - Optional grace period in milliseconds during which
-   *   both old and new keys are accepted. If 0 or omitted, old key is immediately invalidated.
-   * @returns The rotation result with the new private key.
    */
-  rotateKey(identityId: string, gracePeriodMs?: number): KeyRotationResult {
+  async rotateKey(identityId: string, gracePeriodMs?: number): Promise<KeyRotationResult> {
     const identity = this.getIdentity(identityId);
     if (!identity) {
       throw new Error(`Identity '${identityId}' not found`);
     }
 
+    await ensureSodium();
+
     const oldKeyHash = identity.public_key_hash;
 
     // Generate new Ed25519 keypair
-    const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    const secretKey = Buffer.alloc(sodium.crypto_sign_SECRETKEYBYTES);
-    sodium.crypto_sign_keypair(publicKey, secretKey);
+    const keypair = sodium.crypto_sign_keypair();
+    const publicKey = Buffer.from(keypair.publicKey);
+    const secretKey = Buffer.from(keypair.privateKey);
 
     // Hash the new public key
     const newKeyHash = crypto
@@ -300,13 +367,15 @@ export class IdentityDatabase {
     }
 
     // Update the identity in the database
-    this.db.prepare(`
-      UPDATE identities
+    this.db.run(
+      `UPDATE identities
       SET public_key_hash = ?,
           old_public_key_hash = ?,
           old_key_expires_at = ?
-      WHERE id = ?
-    `).run(newKeyHash, oldPublicKeyHash, oldKeyExpiresAt, identityId);
+      WHERE id = ?`,
+      [newKeyHash, oldPublicKeyHash, oldKeyExpiresAt, identityId],
+    );
+    this.save();
 
     const updatedIdentity = this.getIdentity(identityId)!;
 
@@ -319,18 +388,13 @@ export class IdentityDatabase {
     };
 
     // Zero out the secret key buffer
-    sodium.sodium_memzero(secretKey);
+    sodium.memzero(secretKey);
 
     return result;
   }
 
   /**
    * Check if a public key hash is valid for an identity.
-   *
-   * Checks the current key hash first, then falls back to the old key hash
-   * if it exists and has not expired (grace period).
-   *
-   * @returns true if the key hash matches either the current or a valid old key.
    */
   isValidKeyHash(identityId: string, keyHash: string): boolean {
     const identity = this.getIdentity(identityId);
@@ -355,17 +419,30 @@ export class IdentityDatabase {
   }
 
   /**
-   * Clear expired old key hashes. Called during cleanup or rotation.
+   * Clear expired old key hashes.
    */
   clearExpiredOldKeys(): number {
     const nowIso = new Date().toISOString();
-    const result = this.db.prepare(`
-      UPDATE identities
-      SET old_public_key_hash = NULL, old_key_expires_at = NULL
-      WHERE old_key_expires_at IS NOT NULL
-        AND old_key_expires_at < ?
-    `).run(nowIso);
-    return result.changes;
+    // Count matching rows first
+    const countStmt = this.db.prepare(
+      `SELECT COUNT(*) as c FROM identities WHERE old_key_expires_at IS NOT NULL AND old_key_expires_at < ?`,
+    );
+    countStmt.bind([nowIso]);
+    countStmt.step();
+    const count = (countStmt.getAsObject().c as number) || 0;
+    countStmt.free();
+
+    if (count > 0) {
+      this.db.run(
+        `UPDATE identities
+        SET old_public_key_hash = NULL, old_key_expires_at = NULL
+        WHERE old_key_expires_at IS NOT NULL
+          AND old_key_expires_at < ?`,
+        [nowIso],
+      );
+      this.save();
+    }
+    return count;
   }
 
   // ─── Org CRUD ───────────────────────────────────────────────────
@@ -374,7 +451,7 @@ export class IdentityDatabase {
    * Create a new organization.
    * Optionally assigns a founding identity as admin.
    */
-  createOrg(name: string, founderIdentityId?: string): Org {
+  async createOrg(name: string, founderIdentityId?: string): Promise<Org> {
     if (!name || name.trim().length === 0) {
       throw new Error('Org name cannot be empty');
     }
@@ -393,25 +470,21 @@ export class IdentityDatabase {
       }
     }
 
-    const id = generateId();
+    const id = await generateId();
 
-    const insertOrg = this.db.prepare(`
-      INSERT INTO orgs (id, name) VALUES (?, ?)
-    `);
+    this.db.run(
+      `INSERT INTO orgs (id, name) VALUES (?, ?)`,
+      [id, name.trim()],
+    );
 
-    const insertMember = this.db.prepare(`
-      INSERT INTO org_members (identity_id, org_id, role) VALUES (?, ?, 'admin')
-    `);
+    if (founderIdentityId) {
+      this.db.run(
+        `INSERT INTO org_members (identity_id, org_id, role) VALUES (?, ?, 'admin')`,
+        [founderIdentityId, id],
+      );
+    }
 
-    const transaction = this.db.transaction(() => {
-      insertOrg.run(id, name.trim());
-      if (founderIdentityId) {
-        insertMember.run(founderIdentityId, id);
-      }
-    });
-
-    transaction();
-
+    this.save();
     return this.getOrg(id)!;
   }
 
@@ -419,39 +492,54 @@ export class IdentityDatabase {
    * Get an org by ID.
    */
   getOrg(id: string): Org | null {
-    const row = this.db.prepare(
-      'SELECT * FROM orgs WHERE id = ?'
-    ).get(id) as Org | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM orgs WHERE id = ?');
+    stmt.bind([id]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row as unknown as Org;
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * Get an org by name.
    */
   getOrgByName(name: string): Org | null {
-    const row = this.db.prepare(
-      'SELECT * FROM orgs WHERE name = ?'
-    ).get(name) as Org | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM orgs WHERE name = ?');
+    stmt.bind([name]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row as unknown as Org;
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * List all organizations.
    */
   listOrgs(): Org[] {
-    return this.db.prepare(
-      'SELECT * FROM orgs ORDER BY created_at'
-    ).all() as Org[];
+    const results: Org[] = [];
+    const stmt = this.db.prepare('SELECT * FROM orgs ORDER BY created_at');
+    while (stmt.step()) {
+      results.push(stmt.getAsObject() as unknown as Org);
+    }
+    stmt.free();
+    return results;
   }
 
   /**
-   * Delete an org by ID. Also deletes all projects and memberships (via CASCADE).
+   * Delete an org by ID.
    */
   deleteOrg(id: string): boolean {
-    const result = this.db.prepare(
-      'DELETE FROM orgs WHERE id = ?'
-    ).run(id);
-    return result.changes > 0;
+    const exists = this.getOrg(id);
+    if (!exists) return false;
+    this.db.run('DELETE FROM orgs WHERE id = ?', [id]);
+    this.save();
+    return true;
   }
 
   // ─── Org Membership ─────────────────────────────────────────────
@@ -480,9 +568,11 @@ export class IdentityDatabase {
       throw new Error(`Identity '${identityId}' is already a member of org '${orgId}'`);
     }
 
-    this.db.prepare(`
-      INSERT INTO org_members (identity_id, org_id, role) VALUES (?, ?, ?)
-    `).run(identityId, orgId, role);
+    this.db.run(
+      `INSERT INTO org_members (identity_id, org_id, role) VALUES (?, ?, ?)`,
+      [identityId, orgId, role],
+    );
+    this.save();
   }
 
   /**
@@ -493,50 +583,71 @@ export class IdentityDatabase {
       throw new Error(`Invalid role: '${newRole}'. Must be 'admin', 'member', or 'readonly'`);
     }
 
-    const result = this.db.prepare(`
-      UPDATE org_members SET role = ? WHERE org_id = ? AND identity_id = ?
-    `).run(newRole, orgId, identityId);
-
-    if (result.changes === 0) {
+    const existing = this.getOrgMember(orgId, identityId);
+    if (!existing) {
       throw new Error(`Identity '${identityId}' is not a member of org '${orgId}'`);
     }
+
+    this.db.run(
+      `UPDATE org_members SET role = ? WHERE org_id = ? AND identity_id = ?`,
+      [newRole, orgId, identityId],
+    );
+    this.save();
   }
 
   /**
    * Remove a member from an organization.
    */
   removeOrgMember(orgId: string, identityId: string): boolean {
-    const result = this.db.prepare(
-      'DELETE FROM org_members WHERE org_id = ? AND identity_id = ?'
-    ).run(orgId, identityId);
-    return result.changes > 0;
+    const existing = this.getOrgMember(orgId, identityId);
+    if (!existing) return false;
+    this.db.run(
+      'DELETE FROM org_members WHERE org_id = ? AND identity_id = ?',
+      [orgId, identityId],
+    );
+    this.save();
+    return true;
   }
 
   /**
    * Get an org membership record.
    */
   getOrgMember(orgId: string, identityId: string): OrgMember | null {
-    const row = this.db.prepare(
-      'SELECT * FROM org_members WHERE org_id = ? AND identity_id = ?'
-    ).get(orgId, identityId) as OrgMember | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare(
+      'SELECT * FROM org_members WHERE org_id = ? AND identity_id = ?',
+    );
+    stmt.bind([orgId, identityId]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row as unknown as OrgMember;
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * List all members of an organization.
    */
   listOrgMembers(orgId: string): (OrgMember & { name: string; type: IdentityType })[] {
-    return this.db.prepare(`
+    const results: (OrgMember & { name: string; type: IdentityType })[] = [];
+    const stmt = this.db.prepare(`
       SELECT om.identity_id, om.org_id, om.role, i.name, i.type
       FROM org_members om
       JOIN identities i ON i.id = om.identity_id
       WHERE om.org_id = ?
       ORDER BY om.role, i.name
-    `).all(orgId) as (OrgMember & { name: string; type: IdentityType })[];
+    `);
+    stmt.bind([orgId]);
+    while (stmt.step()) {
+      results.push(stmt.getAsObject() as unknown as OrgMember & { name: string; type: IdentityType });
+    }
+    stmt.free();
+    return results;
   }
 
   /**
-   * Get the role of an identity in an org. Returns null if not a member.
+   * Get the role of an identity in an org.
    */
   getOrgRole(orgId: string, identityId: string): MemberRole | null {
     const member = this.getOrgMember(orgId, identityId);
@@ -547,9 +658,8 @@ export class IdentityDatabase {
 
   /**
    * Create a new project within an organization.
-   * Optionally assigns a founding identity as admin.
    */
-  createProject(orgId: string, name: string, founderIdentityId?: string): Project {
+  async createProject(orgId: string, name: string, founderIdentityId?: string): Promise<Project> {
     if (!name || name.trim().length === 0) {
       throw new Error('Project name cannot be empty');
     }
@@ -580,25 +690,21 @@ export class IdentityDatabase {
       throw new Error(`Project '${name.trim()}' already exists in org '${orgId}'`);
     }
 
-    const id = generateId();
+    const id = await generateId();
 
-    const insertProject = this.db.prepare(`
-      INSERT INTO projects (id, org_id, name) VALUES (?, ?, ?)
-    `);
+    this.db.run(
+      `INSERT INTO projects (id, org_id, name) VALUES (?, ?, ?)`,
+      [id, orgId, name.trim()],
+    );
 
-    const insertMember = this.db.prepare(`
-      INSERT INTO project_members (identity_id, project_id, role) VALUES (?, ?, 'admin')
-    `);
+    if (founderIdentityId) {
+      this.db.run(
+        `INSERT INTO project_members (identity_id, project_id, role) VALUES (?, ?, 'admin')`,
+        [founderIdentityId, id],
+      );
+    }
 
-    const transaction = this.db.transaction(() => {
-      insertProject.run(id, orgId, name.trim());
-      if (founderIdentityId) {
-        insertMember.run(founderIdentityId, id);
-      }
-    });
-
-    transaction();
-
+    this.save();
     return this.getProject(id)!;
   }
 
@@ -606,46 +712,61 @@ export class IdentityDatabase {
    * Get a project by ID.
    */
   getProject(id: string): Project | null {
-    const row = this.db.prepare(
-      'SELECT * FROM projects WHERE id = ?'
-    ).get(id) as Project | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM projects WHERE id = ?');
+    stmt.bind([id]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row as unknown as Project;
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * Get a project by name within an org.
    */
   getProjectByName(orgId: string, name: string): Project | null {
-    const row = this.db.prepare(
-      'SELECT * FROM projects WHERE org_id = ? AND name = ?'
-    ).get(orgId, name) as Project | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM projects WHERE org_id = ? AND name = ?');
+    stmt.bind([orgId, name]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row as unknown as Project;
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * List all projects in an organization.
    */
   listProjects(orgId: string): Project[] {
-    return this.db.prepare(
-      'SELECT * FROM projects WHERE org_id = ? ORDER BY created_at'
-    ).all(orgId) as Project[];
+    const results: Project[] = [];
+    const stmt = this.db.prepare('SELECT * FROM projects WHERE org_id = ? ORDER BY created_at');
+    stmt.bind([orgId]);
+    while (stmt.step()) {
+      results.push(stmt.getAsObject() as unknown as Project);
+    }
+    stmt.free();
+    return results;
   }
 
   /**
-   * Delete a project by ID. Also removes all memberships (via CASCADE).
+   * Delete a project by ID.
    */
   deleteProject(id: string): boolean {
-    const result = this.db.prepare(
-      'DELETE FROM projects WHERE id = ?'
-    ).run(id);
-    return result.changes > 0;
+    const exists = this.getProject(id);
+    if (!exists) return false;
+    this.db.run('DELETE FROM projects WHERE id = ?', [id]);
+    this.save();
+    return true;
   }
 
   // ─── Project Membership ─────────────────────────────────────────
 
   /**
    * Add a member to a project with a specified role.
-   * The identity must be a member of the project's parent org.
    */
   addProjectMember(projectId: string, identityId: string, role: MemberRole): void {
     if (!VALID_ROLES.includes(role)) {
@@ -676,9 +797,11 @@ export class IdentityDatabase {
       throw new Error(`Identity '${identityId}' is already a member of project '${projectId}'`);
     }
 
-    this.db.prepare(`
-      INSERT INTO project_members (identity_id, project_id, role) VALUES (?, ?, ?)
-    `).run(identityId, projectId, role);
+    this.db.run(
+      `INSERT INTO project_members (identity_id, project_id, role) VALUES (?, ?, ?)`,
+      [identityId, projectId, role],
+    );
+    this.save();
   }
 
   /**
@@ -689,50 +812,71 @@ export class IdentityDatabase {
       throw new Error(`Invalid role: '${newRole}'. Must be 'admin', 'member', or 'readonly'`);
     }
 
-    const result = this.db.prepare(`
-      UPDATE project_members SET role = ? WHERE project_id = ? AND identity_id = ?
-    `).run(newRole, projectId, identityId);
-
-    if (result.changes === 0) {
+    const existing = this.getProjectMember(projectId, identityId);
+    if (!existing) {
       throw new Error(`Identity '${identityId}' is not a member of project '${projectId}'`);
     }
+
+    this.db.run(
+      `UPDATE project_members SET role = ? WHERE project_id = ? AND identity_id = ?`,
+      [newRole, projectId, identityId],
+    );
+    this.save();
   }
 
   /**
    * Remove a member from a project.
    */
   removeProjectMember(projectId: string, identityId: string): boolean {
-    const result = this.db.prepare(
-      'DELETE FROM project_members WHERE project_id = ? AND identity_id = ?'
-    ).run(projectId, identityId);
-    return result.changes > 0;
+    const existing = this.getProjectMember(projectId, identityId);
+    if (!existing) return false;
+    this.db.run(
+      'DELETE FROM project_members WHERE project_id = ? AND identity_id = ?',
+      [projectId, identityId],
+    );
+    this.save();
+    return true;
   }
 
   /**
    * Get a project membership record.
    */
   getProjectMember(projectId: string, identityId: string): ProjectMember | null {
-    const row = this.db.prepare(
-      'SELECT * FROM project_members WHERE project_id = ? AND identity_id = ?'
-    ).get(projectId, identityId) as ProjectMember | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare(
+      'SELECT * FROM project_members WHERE project_id = ? AND identity_id = ?',
+    );
+    stmt.bind([projectId, identityId]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row as unknown as ProjectMember;
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * List all members of a project.
    */
   listProjectMembers(projectId: string): (ProjectMember & { name: string; type: IdentityType })[] {
-    return this.db.prepare(`
+    const results: (ProjectMember & { name: string; type: IdentityType })[] = [];
+    const stmt = this.db.prepare(`
       SELECT pm.identity_id, pm.project_id, pm.role, i.name, i.type
       FROM project_members pm
       JOIN identities i ON i.id = pm.identity_id
       WHERE pm.project_id = ?
       ORDER BY pm.role, i.name
-    `).all(projectId) as (ProjectMember & { name: string; type: IdentityType })[];
+    `);
+    stmt.bind([projectId]);
+    while (stmt.step()) {
+      results.push(stmt.getAsObject() as unknown as ProjectMember & { name: string; type: IdentityType });
+    }
+    stmt.free();
+    return results;
   }
 
   /**
-   * Get the role of an identity in a project. Returns null if not a member.
+   * Get the role of an identity in a project.
    */
   getProjectRole(projectId: string, identityId: string): MemberRole | null {
     const member = this.getProjectMember(projectId, identityId);
@@ -743,60 +887,98 @@ export class IdentityDatabase {
 
   /**
    * Verify that a private key corresponds to a stored identity.
-   * Returns the identity if the key matches, null otherwise.
-   *
-   * Also checks old keys within grace period.
    */
-  verifyIdentity(privateKeyBase64: string): Identity | null {
+  async verifyIdentity(privateKeyBase64: string): Promise<Identity | null> {
     try {
+      await ensureSodium();
       const secretKey = Buffer.from(privateKeyBase64, 'base64');
       if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
         return null;
       }
 
       // Extract the public key from the secret key
-      const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-      sodium.crypto_sign_ed25519_sk_to_pk(publicKey, secretKey);
+      const publicKey = sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(secretKey));
 
       // Hash and look up
       const publicKeyHash = crypto
         .createHash('sha256')
-        .update(publicKey)
+        .update(Buffer.from(publicKey))
         .digest('hex');
 
       // Check current key
-      let row = this.db.prepare(
-        'SELECT * FROM identities WHERE public_key_hash = ?'
-      ).get(publicKeyHash) as Identity | undefined;
+      let identity: Identity | null = null;
+      const stmt1 = this.db.prepare('SELECT * FROM identities WHERE public_key_hash = ?');
+      stmt1.bind([publicKeyHash]);
+      if (stmt1.step()) {
+        identity = this.toIdentity(stmt1.getAsObject());
+      }
+      stmt1.free();
 
       // Check old key within grace period
-      if (!row) {
-        row = this.db.prepare(
-          'SELECT * FROM identities WHERE old_public_key_hash = ? AND old_key_expires_at IS NOT NULL'
-        ).get(publicKeyHash) as Identity | undefined;
-
-        if (row && row.old_key_expires_at) {
-          const expiresAt = new Date(row.old_key_expires_at).getTime();
-          if (Date.now() > expiresAt) {
-            row = undefined; // Grace period expired
+      if (!identity) {
+        const stmt2 = this.db.prepare(
+          'SELECT * FROM identities WHERE old_public_key_hash = ? AND old_key_expires_at IS NOT NULL',
+        );
+        stmt2.bind([publicKeyHash]);
+        if (stmt2.step()) {
+          const row = this.toIdentity(stmt2.getAsObject());
+          if (row.old_key_expires_at) {
+            const expiresAt = new Date(row.old_key_expires_at).getTime();
+            if (Date.now() <= expiresAt) {
+              identity = row;
+            }
           }
         }
+        stmt2.free();
       }
 
       // Zero out the secret key
-      sodium.sodium_memzero(secretKey);
+      sodium.memzero(secretKey);
 
-      return row ?? null;
+      return identity;
     } catch {
       return null;
     }
   }
 
   /**
+   * Get the underlying sql.js database. Used by AccessRequestManager.
+   */
+  getRawDb(): SqlJsDatabase {
+    return this.db;
+  }
+
+  /**
+   * Save pending changes to disk.
+   */
+  persist(): void {
+    this.save();
+  }
+
+  /**
    * Close the database connection.
    */
   close(): void {
+    try {
+      this.save();
+    } catch {
+      // best effort save on close
+    }
     this.db.close();
+  }
+
+  // ─── Row mapping ────────────────────────────────────────────────
+
+  private toIdentity(row: Record<string, unknown>): Identity {
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      type: row.type as IdentityType,
+      public_key_hash: row.public_key_hash as string,
+      created_at: row.created_at as string,
+      old_public_key_hash: (row.old_public_key_hash as string) ?? null,
+      old_key_expires_at: (row.old_key_expires_at as string) ?? null,
+    };
   }
 }
 
@@ -805,10 +987,10 @@ export class IdentityDatabase {
 /**
  * Generate a random ID (16 bytes, hex encoded = 32 chars).
  */
-function generateId(): string {
-  const buf = Buffer.alloc(16);
-  sodium.randombytes_buf(buf);
-  return buf.toString('hex');
+async function generateId(): Promise<string> {
+  await ensureSodium();
+  const buf = sodium.randombytes_buf(16);
+  return Buffer.from(buf).toString('hex');
 }
 
 /**

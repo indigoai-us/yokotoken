@@ -46,24 +46,17 @@ export function parseDuration(input: string): number | null {
 }
 
 /**
- * Parse a datetime string as UTC. SQLite's datetime('now') produces
- * strings like '2026-03-01 08:53:26' without a timezone suffix.
- * JavaScript's Date() parses these as local time, so we append 'Z'
- * when needed to ensure UTC interpretation.
+ * Parse a datetime string as UTC.
  */
 function parseUtcDate(dateStr: string): number {
-  // If it already has a timezone indicator (Z, +, -), parse as-is
   if (dateStr.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(dateStr) || dateStr.includes('T')) {
     return new Date(dateStr).getTime();
   }
-  // SQLite format: '2026-03-01 08:53:26' — treat as UTC
   return new Date(dateStr + 'Z').getTime();
 }
 
 /**
  * Determine if a secret row is "stale" — past its rotation interval.
- *
- * Stale means: (last_rotated_at || created_at) + rotation_interval < now
  */
 function isStale(row: SecretRow, nowMs: number): boolean {
   if (!row.rotation_interval) return false;
@@ -92,9 +85,7 @@ export interface SecretEntry {
   metadata: SecretMetadata;
   createdAt: string;
   updatedAt: string;
-  /** True if the secret is past its expires_at date (advisory, not enforcement). */
   expired?: boolean;
-  /** True if the secret is past its rotation interval. */
   stale?: boolean;
 }
 
@@ -119,18 +110,24 @@ export class VaultEngine {
   private masterKey: Buffer | null = null;
   private vaultPath: string;
 
-  constructor(dbPath: string) {
+  /** Use VaultEngine.open(dbPath) instead. */
+  private constructor(db: VaultDatabase, dbPath: string) {
     this.vaultPath = dbPath;
-    this.db = new VaultDatabase(dbPath);
+    this.db = db;
+  }
+
+  /**
+   * Open or create a vault engine at the given path.
+   */
+  static async open(dbPath: string): Promise<VaultEngine> {
+    const db = await VaultDatabase.open(dbPath);
+    return new VaultEngine(db, dbPath);
   }
 
   /**
    * Initialize a new vault with a passphrase.
-   * Generates a random salt and derives the master key.
-   *
-   * Throws if the vault is already initialized (has a salt).
    */
-  init(passphrase: string): void {
+  async init(passphrase: string): Promise<void> {
     const existingSalt = this.db.getMeta('salt');
     if (existingSalt) {
       throw new Error(
@@ -138,26 +135,23 @@ export class VaultEngine {
       );
     }
 
-    const salt = generateSalt();
+    const salt = await generateSalt();
     this.db.setMeta('salt', salt);
     this.db.setMeta('version', '1');
 
     // Derive and hold the master key
-    this.masterKey = deriveMasterKey(passphrase, salt);
+    this.masterKey = await deriveMasterKey(passphrase, salt);
 
     // Store a verification entry so we can validate passphrases on unlock
     const verifyPlaintext = Buffer.from('hq-vault-ok', 'utf-8');
-    const { ciphertext, nonce } = encrypt(verifyPlaintext, this.masterKey);
+    const { ciphertext, nonce } = await encrypt(verifyPlaintext, this.masterKey);
     this.db.storeSecret('__vault_verify__', ciphertext, nonce, 'system', 'Vault verification entry');
   }
 
   /**
    * Unlock the vault by deriving the master key from the passphrase.
-   *
-   * Validates the passphrase by attempting to decrypt a verification entry
-   * stored during init().
    */
-  unlock(passphrase: string): void {
+  async unlock(passphrase: string): Promise<void> {
     const salt = this.db.getMeta('salt');
     if (!salt) {
       throw new Error('Vault is not initialized. Run init() first.');
@@ -166,28 +160,28 @@ export class VaultEngine {
       throw new Error('Corrupt vault: invalid salt length');
     }
 
-    const candidateKey = deriveMasterKey(passphrase, salt);
+    const candidateKey = await deriveMasterKey(passphrase, salt);
 
     // Verify the passphrase against the verification entry stored during init()
     const verifyRow = this.db.getSecretRow('__vault_verify__');
     if (!verifyRow) {
-      secureZero(candidateKey);
+      await secureZero(candidateKey);
       throw new Error('Corrupt vault: missing verification entry');
     }
 
     try {
-      const decrypted = decrypt(
+      const decrypted = await decrypt(
         verifyRow.encrypted_value,
         verifyRow.nonce,
         candidateKey,
       );
       const text = decrypted.toString('utf-8');
       if (text !== 'hq-vault-ok') {
-        secureZero(candidateKey);
+        await secureZero(candidateKey);
         throw new Error('Invalid passphrase');
       }
     } catch (err) {
-      secureZero(candidateKey);
+      await secureZero(candidateKey);
       if (err instanceof Error && err.message === 'Invalid passphrase') {
         throw err;
       }
@@ -196,7 +190,7 @@ export class VaultEngine {
 
     // Wipe old key if any
     if (this.masterKey) {
-      secureZero(this.masterKey);
+      await secureZero(this.masterKey);
     }
     this.masterKey = candidateKey;
   }
@@ -204,9 +198,9 @@ export class VaultEngine {
   /**
    * Lock the vault by securely wiping the master key from memory.
    */
-  lock(): void {
+  async lock(): Promise<void> {
     if (this.masterKey) {
-      secureZero(this.masterKey);
+      await secureZero(this.masterKey);
       this.masterKey = null;
     }
   }
@@ -237,20 +231,17 @@ export class VaultEngine {
 
   /**
    * Store a secret at the given path.
-   *
-   * The value is encrypted with XChaCha20-Poly1305 before storage.
-   * If a secret already exists at the path, it will be overwritten.
    */
-  store(
+  async store(
     secretPath: string,
     value: string,
     metadata?: SecretMetadata,
-  ): void {
+  ): Promise<void> {
     const key = this.requireUnlocked();
     this.validatePath(secretPath);
 
     const plaintext = Buffer.from(value, 'utf-8');
-    const { ciphertext, nonce } = encrypt(plaintext, key);
+    const { ciphertext, nonce } = await encrypt(plaintext, key);
 
     this.db.storeSecret(
       secretPath,
@@ -268,13 +259,8 @@ export class VaultEngine {
 
   /**
    * Retrieve and decrypt a secret at the given path.
-   *
-   * Returns null if no secret exists at the path.
-   * Throws if decryption fails (should not happen with correct key).
-   *
-   * Includes `expired` and `stale` advisory flags (US-009).
    */
-  get(secretPath: string): SecretEntry | null {
+  async get(secretPath: string): Promise<SecretEntry | null> {
     const key = this.requireUnlocked();
     this.validatePath(secretPath);
 
@@ -283,7 +269,7 @@ export class VaultEngine {
       return null;
     }
 
-    const decrypted = decrypt(row.encrypted_value, row.nonce, key);
+    const decrypted = await decrypt(row.encrypted_value, row.nonce, key);
 
     const now = Date.now();
     const expired = row.expires_at ? parseUtcDate(row.expires_at) < now : false;
@@ -308,7 +294,6 @@ export class VaultEngine {
 
   /**
    * List secrets, optionally filtered by path prefix.
-   *
    * Returns metadata only — NOT decrypted values.
    */
   list(prefix?: string): SecretListEntry[] {
@@ -336,8 +321,6 @@ export class VaultEngine {
 
   /**
    * Delete a secret at the given path.
-   *
-   * Returns true if the secret was deleted, false if it didn't exist.
    */
   delete(secretPath: string): boolean {
     this.requireUnlocked();
@@ -355,7 +338,6 @@ export class VaultEngine {
    */
   status(): VaultStatus {
     const totalCount = this.db.countSecrets();
-    // Subtract 1 for the __vault_verify__ entry if it exists
     const hasVerify = this.db.hasSecret('__vault_verify__');
     const userSecretCount = hasVerify ? totalCount - 1 : totalCount;
 
@@ -371,9 +353,6 @@ export class VaultEngine {
 
   /**
    * List secrets expiring within the given time window.
-   *
-   * @param withinMs - Time window in milliseconds from now (default: 7 days)
-   * @returns Secrets with expires_at within the window (including already expired)
    */
   expiringSecrets(withinMs: number = 7 * 24 * 60 * 60 * 1000): SecretListEntry[] {
     this.requireUnlocked();
@@ -400,9 +379,6 @@ export class VaultEngine {
 
   /**
    * List secrets that are past their rotation interval (stale).
-   *
-   * A secret is stale when:
-   *   (last_rotated_at || created_at) + rotation_interval < now
    */
   staleSecrets(): SecretListEntry[] {
     this.requireUnlocked();
@@ -429,17 +405,22 @@ export class VaultEngine {
   }
 
   /**
+   * Get the underlying database (for token manager, etc.).
+   */
+  getDb(): VaultDatabase {
+    return this.db;
+  }
+
+  /**
    * Close the vault, securely wiping the key and closing the database.
    */
-  close(): void {
-    this.lock();
+  async close(): Promise<void> {
+    await this.lock();
     this.db.close();
   }
 
   /**
    * Validate a secret path.
-   * Paths must be non-empty, not start/end with slashes, and not contain
-   * consecutive slashes or the reserved __vault prefix.
    */
   private validatePath(secretPath: string): void {
     if (!secretPath || secretPath.trim().length === 0) {

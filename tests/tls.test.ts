@@ -126,9 +126,9 @@ describe('TLS — HTTPS server', () => {
       // insecure NOT set — server should use HTTPS
     };
 
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(config) as https.Server;
     const addr = server.address();

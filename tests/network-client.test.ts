@@ -19,7 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
-import sodium from 'sodium-native';
+import sodium from 'libsodium-wrappers-sumo';
 import crypto from 'node:crypto';
 
 import {
@@ -54,7 +54,7 @@ function createTmpDir(prefix = 'hq-vault-netclient-'): string {
 }
 
 /** Create an identity database and an identity with keypair. */
-function createIdentitySetup(): {
+async function createIdentitySetup(): Promise<{
   tmpDir: string;
   identityDbPath: string;
   identityDb: IdentityDatabase;
@@ -63,12 +63,12 @@ function createIdentitySetup(): {
   privateKeyBase64: string;
   publicKeyBase64: string;
   keyFilePath: string;
-} {
+}> {
   const tmpDir = createTmpDir('hq-vault-netclient-identity-');
   const identityDbPath = path.join(tmpDir, 'identity.db');
-  const identityDb = new IdentityDatabase(identityDbPath);
+  const identityDb = await IdentityDatabase.open(identityDbPath);
 
-  const result = identityDb.createIdentity('test-agent', 'agent');
+  const result = await identityDb.createIdentity('test-agent', 'agent');
   const identityId = result.identity.id;
   const identityName = result.identity.name;
   const privateKeyBase64 = result.privateKey;
@@ -477,10 +477,10 @@ describe('NetworkVaultClient — connection errors', () => {
 describe('NetworkVaultClient — token-based auth', () => {
   let server: http.Server;
   let srvTmpDir: string;
-  let idSetup: ReturnType<typeof createIdentitySetup>;
+  let idSetup: Awaited<ReturnType<typeof createIdentitySetup>>;
 
   beforeAll(async () => {
-    idSetup = createIdentitySetup();
+    idSetup = await createIdentitySetup();
     const { tmpDir, config } = createServerConfig(idSetup.identityDbPath);
     srvTmpDir = tmpDir;
     server = (await createVaultServer(config)) as http.Server;
@@ -521,12 +521,12 @@ describe('NetworkVaultClient — token-based auth', () => {
 describe('NetworkVaultClient — identity-based auth (challenge-response)', () => {
   let server: http.Server;
   let srvTmpDir: string;
-  let idSetup: ReturnType<typeof createIdentitySetup>;
+  let idSetup: Awaited<ReturnType<typeof createIdentitySetup>>;
 
   beforeAll(async () => {
-    idSetup = createIdentitySetup();
+    idSetup = await createIdentitySetup();
     // Create an org and add the identity as admin so they have access
-    const org = idSetup.identityDb.createOrg('test-org', idSetup.identityId);
+    const org = await idSetup.identityDb.createOrg('test-org', idSetup.identityId);
     const { tmpDir, config } = createServerConfig(idSetup.identityDbPath);
     srvTmpDir = tmpDir;
     server = (await createVaultServer(config)) as http.Server;
@@ -607,9 +607,10 @@ describe('NetworkVaultClient — identity-based auth (challenge-response)', () =
 
   it('should fail auth with wrong private key', async () => {
     // Generate a different keypair
-    const wrongPub = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    const wrongSec = Buffer.alloc(sodium.crypto_sign_SECRETKEYBYTES);
-    sodium.crypto_sign_keypair(wrongPub, wrongSec);
+    await sodium.ready;
+    const wrongKp = sodium.crypto_sign_keypair();
+    const wrongPub = Buffer.from(wrongKp.publicKey);
+    const wrongSec = Buffer.from(wrongKp.privateKey);
 
     const client = new NetworkVaultClient({
       url: `http://127.0.0.1:${getPort(server)}`,
@@ -683,12 +684,12 @@ describe('NetworkClientError', () => {
 describe('SDK — identity-based auth integration', () => {
   let server: http.Server;
   let srvTmpDir: string;
-  let idSetup: ReturnType<typeof createIdentitySetup>;
+  let idSetup: Awaited<ReturnType<typeof createIdentitySetup>>;
   const savedEnv: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
-    idSetup = createIdentitySetup();
-    idSetup.identityDb.createOrg('test-org', idSetup.identityId);
+    idSetup = await createIdentitySetup();
+    await idSetup.identityDb.createOrg('test-org', idSetup.identityId);
     const { tmpDir, config } = createServerConfig(idSetup.identityDbPath);
     srvTmpDir = tmpDir;
     server = (await createVaultServer(config)) as http.Server;

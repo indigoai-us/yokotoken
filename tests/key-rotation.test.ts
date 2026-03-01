@@ -27,7 +27,7 @@ import {
   ed25519Sign,
 } from '../src/network-auth.js';
 import { AuditLogger, readAuditLog } from '../src/audit.js';
-import sodium from 'sodium-native';
+import sodium from 'libsodium-wrappers-sumo';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -38,10 +38,10 @@ import os from 'node:os';
 let tmpDir: string;
 let db: IdentityDatabase;
 
-function createTestDb(): IdentityDatabase {
+async function createTestDb(): Promise<IdentityDatabase> {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-keyrot-'));
   const dbPath = path.join(tmpDir, 'identity.db');
-  return new IdentityDatabase(dbPath);
+  return await IdentityDatabase.open(dbPath);
 }
 
 function cleanupTestDb(): void {
@@ -59,15 +59,14 @@ function hashPublicKey(publicKey: Buffer): string {
 }
 
 /** Extract public key from private key. */
-function extractPublicKey(privateKeyBase64: string): Buffer {
+async function extractPublicKey(privateKeyBase64: string): Promise<Buffer> {
   const secretKey = Buffer.from(privateKeyBase64, 'base64');
-  const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-  sodium.crypto_sign_ed25519_sk_to_pk(publicKey, secretKey);
-  return publicKey;
+  await sodium.ready;
+  return Buffer.from(sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(secretKey)));
 }
 
-beforeEach(() => {
-  db = createTestDb();
+beforeEach(async () => {
+  db = await createTestDb();
 });
 
 afterEach(() => {
@@ -77,11 +76,11 @@ afterEach(() => {
 // ─── rotateKey() ─────────────────────────────────────────────────
 
 describe('Key Rotation — rotateKey()', () => {
-  it('should generate a new keypair and update the stored hash', () => {
-    const original = db.createIdentity('alice', 'human');
+  it('should generate a new keypair and update the stored hash', async () => {
+    const original = await db.createIdentity('alice', 'human');
     const originalKeyHash = original.identity.public_key_hash;
 
-    const result = db.rotateKey(original.identity.id);
+    const result = await db.rotateKey(original.identity.id);
 
     // New key should be different
     expect(result.identity.public_key_hash).not.toBe(originalKeyHash);
@@ -99,11 +98,11 @@ describe('Key Rotation — rotateKey()', () => {
     expect(result.newKeyHashPrefix).toBe(result.identity.public_key_hash.substring(0, 12));
   });
 
-  it('should immediately invalidate old key without grace period', () => {
-    const original = db.createIdentity('alice', 'human');
+  it('should immediately invalidate old key without grace period', async () => {
+    const original = await db.createIdentity('alice', 'human');
     const originalKeyHash = original.identity.public_key_hash;
 
-    const result = db.rotateKey(original.identity.id);
+    const result = await db.rotateKey(original.identity.id);
 
     // Old key hash fields should be null (no grace period)
     expect(result.identity.old_public_key_hash).toBeNull();
@@ -116,12 +115,12 @@ describe('Key Rotation — rotateKey()', () => {
     expect(db.isValidKeyHash(original.identity.id, result.identity.public_key_hash)).toBe(true);
   });
 
-  it('should keep old key valid during grace period', () => {
-    const original = db.createIdentity('alice', 'human');
+  it('should keep old key valid during grace period', async () => {
+    const original = await db.createIdentity('alice', 'human');
     const originalKeyHash = original.identity.public_key_hash;
 
     // Rotate with 1 hour grace period
-    const result = db.rotateKey(original.identity.id, 60 * 60 * 1000);
+    const result = await db.rotateKey(original.identity.id, 60 * 60 * 1000);
 
     // Old key hash should be stored
     expect(result.identity.old_public_key_hash).toBe(originalKeyHash);
@@ -133,11 +132,11 @@ describe('Key Rotation — rotateKey()', () => {
   });
 
   it('should invalidate old key after grace period expires', async () => {
-    const original = db.createIdentity('alice', 'human');
+    const original = await db.createIdentity('alice', 'human');
     const originalKeyHash = original.identity.public_key_hash;
 
     // Rotate with 50ms grace period
-    db.rotateKey(original.identity.id, 50);
+    await db.rotateKey(original.identity.id, 50);
 
     // Old key should be valid immediately
     expect(db.isValidKeyHash(original.identity.id, originalKeyHash)).toBe(true);
@@ -149,15 +148,15 @@ describe('Key Rotation — rotateKey()', () => {
     expect(db.isValidKeyHash(original.identity.id, originalKeyHash)).toBe(false);
   });
 
-  it('should throw for nonexistent identity', () => {
-    expect(() => db.rotateKey('nonexistent')).toThrow("Identity 'nonexistent' not found");
+  it('should throw for nonexistent identity', async () => {
+    await expect(db.rotateKey('nonexistent')).rejects.toThrow("Identity 'nonexistent' not found");
   });
 
-  it('should allow multiple consecutive rotations', () => {
-    const original = db.createIdentity('alice', 'human');
+  it('should allow multiple consecutive rotations', async () => {
+    const original = await db.createIdentity('alice', 'human');
 
-    const rotation1 = db.rotateKey(original.identity.id);
-    const rotation2 = db.rotateKey(original.identity.id);
+    const rotation1 = await db.rotateKey(original.identity.id);
+    const rotation2 = await db.rotateKey(original.identity.id);
 
     // Final key should be from rotation2
     const identity = db.getIdentity(original.identity.id)!;
@@ -167,15 +166,15 @@ describe('Key Rotation — rotateKey()', () => {
     expect(db.isValidKeyHash(original.identity.id, rotation1.identity.public_key_hash)).toBe(false);
   });
 
-  it('should allow rotation with grace period then another rotation replaces old key', () => {
-    const original = db.createIdentity('alice', 'human');
+  it('should allow rotation with grace period then another rotation replaces old key', async () => {
+    const original = await db.createIdentity('alice', 'human');
     const originalKeyHash = original.identity.public_key_hash;
 
     // First rotation with grace period
-    const rotation1 = db.rotateKey(original.identity.id, 60 * 60 * 1000);
+    const rotation1 = await db.rotateKey(original.identity.id, 60 * 60 * 1000);
 
     // Second rotation without grace period
-    const rotation2 = db.rotateKey(original.identity.id);
+    const rotation2 = await db.rotateKey(original.identity.id);
 
     // Original key should now be invalid (replaced by rotation1's old key which was then replaced)
     expect(db.isValidKeyHash(original.identity.id, originalKeyHash)).toBe(false);
@@ -189,45 +188,45 @@ describe('Key Rotation — rotateKey()', () => {
 // ─── verifyIdentity after rotation ─────────────────────────────
 
 describe('Key Rotation — verifyIdentity()', () => {
-  it('should verify with new key after rotation', () => {
-    const original = db.createIdentity('alice', 'human');
-    const rotation = db.rotateKey(original.identity.id);
+  it('should verify with new key after rotation', async () => {
+    const original = await db.createIdentity('alice', 'human');
+    const rotation = await db.rotateKey(original.identity.id);
 
     // New key should verify
-    const verified = db.verifyIdentity(rotation.privateKey);
+    const verified = await db.verifyIdentity(rotation.privateKey);
     expect(verified).not.toBeNull();
     expect(verified!.id).toBe(original.identity.id);
     expect(verified!.name).toBe('alice');
   });
 
-  it('should not verify with old key after rotation (no grace period)', () => {
-    const original = db.createIdentity('alice', 'human');
-    db.rotateKey(original.identity.id);
+  it('should not verify with old key after rotation (no grace period)', async () => {
+    const original = await db.createIdentity('alice', 'human');
+    await db.rotateKey(original.identity.id);
 
     // Old key should no longer verify
-    const verified = db.verifyIdentity(original.privateKey);
+    const verified = await db.verifyIdentity(original.privateKey);
     expect(verified).toBeNull();
   });
 
-  it('should verify with old key during grace period', () => {
-    const original = db.createIdentity('alice', 'human');
-    db.rotateKey(original.identity.id, 60 * 60 * 1000); // 1 hour
+  it('should verify with old key during grace period', async () => {
+    const original = await db.createIdentity('alice', 'human');
+    await db.rotateKey(original.identity.id, 60 * 60 * 1000); // 1 hour
 
     // Old key should still verify during grace period
-    const verified = db.verifyIdentity(original.privateKey);
+    const verified = await db.verifyIdentity(original.privateKey);
     expect(verified).not.toBeNull();
     expect(verified!.id).toBe(original.identity.id);
   });
 
   it('should not verify with old key after grace period expires', async () => {
-    const original = db.createIdentity('alice', 'human');
-    db.rotateKey(original.identity.id, 50); // 50ms
+    const original = await db.createIdentity('alice', 'human');
+    await db.rotateKey(original.identity.id, 50); // 50ms
 
     // Wait for grace period to expire
     await new Promise((r) => setTimeout(r, 100));
 
     // Old key should no longer verify
-    const verified = db.verifyIdentity(original.privateKey);
+    const verified = await db.verifyIdentity(original.privateKey);
     expect(verified).toBeNull();
   });
 });
@@ -235,13 +234,13 @@ describe('Key Rotation — verifyIdentity()', () => {
 // ─── isValidKeyHash() ───────────────────────────────────────────
 
 describe('Key Rotation — isValidKeyHash()', () => {
-  it('should return true for current key hash', () => {
-    const { identity } = db.createIdentity('alice', 'human');
+  it('should return true for current key hash', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
     expect(db.isValidKeyHash(identity.id, identity.public_key_hash)).toBe(true);
   });
 
-  it('should return false for random hash', () => {
-    const { identity } = db.createIdentity('alice', 'human');
+  it('should return false for random hash', async () => {
+    const { identity } = await db.createIdentity('alice', 'human');
     expect(db.isValidKeyHash(identity.id, 'deadbeef'.repeat(8))).toBe(false);
   });
 
@@ -300,10 +299,10 @@ describe('Key Rotation — NetworkAuthenticator integration', () => {
   let identityDb: IdentityDatabase;
   let auth: NetworkAuthenticator;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-keyrot-auth-'));
     const dbPath = path.join(testDir, 'identity.db');
-    identityDb = new IdentityDatabase(dbPath);
+    identityDb = await IdentityDatabase.open(dbPath);
     auth = new NetworkAuthenticator(identityDb);
   });
 
@@ -313,18 +312,18 @@ describe('Key Rotation — NetworkAuthenticator integration', () => {
     try { fs.rmSync(testDir, { recursive: true, force: true }); } catch { /* ok */ }
   });
 
-  it('should invalidate old sessions after key rotation (no grace period)', () => {
+  it('should invalidate old sessions after key rotation (no grace period)', async () => {
     // Create identity and authenticate
-    const idResult = identityDb.createIdentity('rotate-agent-1', 'agent');
+    const idResult = await identityDb.createIdentity('rotate-agent-1', 'agent');
     const secretKey = Buffer.from(idResult.privateKey, 'base64');
-    const publicKey = extractPublicKey(idResult.privateKey);
+    const publicKey = await extractPublicKey(idResult.privateKey);
 
     // Create a session
-    const challenge = auth.issueChallenge(idResult.identity.id)!;
+    const challenge = await auth.issueChallenge(idResult.identity.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
-    const signature = ed25519Sign(nonce, secretKey);
+    const signature = await ed25519Sign(nonce, secretKey);
 
-    const verifyResult = auth.verifyChallenge(
+    const verifyResult = await auth.verifyChallenge(
       challenge.challenge_id,
       idResult.identity.id,
       signature.toString('base64url'),
@@ -337,7 +336,7 @@ describe('Key Rotation — NetworkAuthenticator integration', () => {
     expect(sessionBefore.valid).toBe(true);
 
     // Rotate key (no grace period) and revoke sessions
-    identityDb.rotateKey(idResult.identity.id);
+    await identityDb.rotateKey(idResult.identity.id);
     auth.sessions.revokeSessionsForIdentity(idResult.identity.id);
 
     // Old session should be invalidated
@@ -345,21 +344,21 @@ describe('Key Rotation — NetworkAuthenticator integration', () => {
     expect(sessionAfter.valid).toBe(false);
   });
 
-  it('should accept old key during grace period for auth', () => {
+  it('should accept old key during grace period for auth', async () => {
     // Create identity
-    const idResult = identityDb.createIdentity('rotate-agent-2', 'agent');
+    const idResult = await identityDb.createIdentity('rotate-agent-2', 'agent');
     const oldSecretKey = Buffer.from(idResult.privateKey, 'base64');
-    const oldPublicKey = extractPublicKey(idResult.privateKey);
+    const oldPublicKey = await extractPublicKey(idResult.privateKey);
 
     // Rotate with 1 hour grace period
-    const rotation = identityDb.rotateKey(idResult.identity.id, 60 * 60 * 1000);
+    const rotation = await identityDb.rotateKey(idResult.identity.id, 60 * 60 * 1000);
 
     // Authenticate with OLD key (should work during grace period)
-    const challenge = auth.issueChallenge(idResult.identity.id)!;
+    const challenge = await auth.issueChallenge(idResult.identity.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
-    const signature = ed25519Sign(nonce, oldSecretKey);
+    const signature = await ed25519Sign(nonce, oldSecretKey);
 
-    const verifyResult = auth.verifyChallenge(
+    const verifyResult = await auth.verifyChallenge(
       challenge.challenge_id,
       idResult.identity.id,
       signature.toString('base64url'),
@@ -370,21 +369,21 @@ describe('Key Rotation — NetworkAuthenticator integration', () => {
     expect(verifyResult.session_token).toBeTruthy();
   });
 
-  it('should accept new key after rotation for auth', () => {
+  it('should accept new key after rotation for auth', async () => {
     // Create identity
-    const idResult = identityDb.createIdentity('rotate-agent-3', 'agent');
+    const idResult = await identityDb.createIdentity('rotate-agent-3', 'agent');
 
     // Rotate key
-    const rotation = identityDb.rotateKey(idResult.identity.id);
+    const rotation = await identityDb.rotateKey(idResult.identity.id);
     const newSecretKey = Buffer.from(rotation.privateKey, 'base64');
-    const newPublicKey = extractPublicKey(rotation.privateKey);
+    const newPublicKey = await extractPublicKey(rotation.privateKey);
 
     // Authenticate with NEW key
-    const challenge = auth.issueChallenge(idResult.identity.id)!;
+    const challenge = await auth.issueChallenge(idResult.identity.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
-    const signature = ed25519Sign(nonce, newSecretKey);
+    const signature = await ed25519Sign(nonce, newSecretKey);
 
-    const verifyResult = auth.verifyChallenge(
+    const verifyResult = await auth.verifyChallenge(
       challenge.challenge_id,
       idResult.identity.id,
       signature.toString('base64url'),
@@ -395,21 +394,21 @@ describe('Key Rotation — NetworkAuthenticator integration', () => {
     expect(verifyResult.session_token).toBeTruthy();
   });
 
-  it('should reject old key after rotation without grace period', () => {
+  it('should reject old key after rotation without grace period', async () => {
     // Create identity
-    const idResult = identityDb.createIdentity('rotate-agent-4', 'agent');
+    const idResult = await identityDb.createIdentity('rotate-agent-4', 'agent');
     const oldSecretKey = Buffer.from(idResult.privateKey, 'base64');
-    const oldPublicKey = extractPublicKey(idResult.privateKey);
+    const oldPublicKey = await extractPublicKey(idResult.privateKey);
 
     // Rotate without grace period
-    identityDb.rotateKey(idResult.identity.id);
+    await identityDb.rotateKey(idResult.identity.id);
 
     // Authenticate with OLD key (should fail)
-    const challenge = auth.issueChallenge(idResult.identity.id)!;
+    const challenge = await auth.issueChallenge(idResult.identity.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
-    const signature = ed25519Sign(nonce, oldSecretKey);
+    const signature = await ed25519Sign(nonce, oldSecretKey);
 
-    const verifyResult = auth.verifyChallenge(
+    const verifyResult = await auth.verifyChallenge(
       challenge.challenge_id,
       idResult.identity.id,
       signature.toString('base64url'),
@@ -424,15 +423,15 @@ describe('Key Rotation — NetworkAuthenticator integration', () => {
 // ─── Audit logging ──────────────────────────────────────────────
 
 describe('Key Rotation — Audit logging', () => {
-  it('should log identity.key_rotated with old and new hash prefixes', () => {
+  it('should log identity.key_rotated with old and new hash prefixes', async () => {
     const auditDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-keyrot-audit-'));
     const auditLogPath = path.join(auditDir, 'audit.log');
 
     try {
       const auditLogger = new AuditLogger(auditLogPath);
 
-      const original = db.createIdentity('audit-test', 'human');
-      const rotation = db.rotateKey(original.identity.id);
+      const original = await db.createIdentity('audit-test', 'human');
+      const rotation = await db.rotateKey(original.identity.id);
 
       // Log the rotation event
       auditLogger.logNetworkEvent('identity.key_rotated', {
@@ -467,11 +466,11 @@ describe('Key Rotation — Audit logging', () => {
 
 describe('Key Rotation — clearExpiredOldKeys()', () => {
   it('should clear expired old key hashes', async () => {
-    const original = db.createIdentity('alice', 'human');
+    const original = await db.createIdentity('alice', 'human');
     const originalKeyHash = original.identity.public_key_hash;
 
     // Rotate with very short grace period
-    db.rotateKey(original.identity.id, 50); // 50ms
+    await db.rotateKey(original.identity.id, 50); // 50ms
 
     // Verify old key is stored
     let identity = db.getIdentity(original.identity.id)!;
@@ -490,11 +489,11 @@ describe('Key Rotation — clearExpiredOldKeys()', () => {
     expect(identity.old_key_expires_at).toBeNull();
   });
 
-  it('should not clear old keys that have not expired', () => {
-    const original = db.createIdentity('alice', 'human');
+  it('should not clear old keys that have not expired', async () => {
+    const original = await db.createIdentity('alice', 'human');
 
     // Rotate with 1 hour grace period
-    db.rotateKey(original.identity.id, 60 * 60 * 1000);
+    await db.rotateKey(original.identity.id, 60 * 60 * 1000);
 
     // Clear expired old keys (should not clear anything)
     const cleared = db.clearExpiredOldKeys();

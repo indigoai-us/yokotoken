@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import sodium from 'sodium-native';
+import sodium from 'libsodium-wrappers-sumo';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -37,11 +37,10 @@ import { request, type ClientConfig } from '../src/client.js';
 const TEST_TOKEN = 'test-network-auth-token';
 
 /** Generate an Ed25519 keypair. */
-function generateKeypair(): { publicKey: Buffer; secretKey: Buffer } {
-  const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-  const secretKey = Buffer.alloc(sodium.crypto_sign_SECRETKEYBYTES);
-  sodium.crypto_sign_keypair(publicKey, secretKey);
-  return { publicKey, secretKey };
+async function generateKeypair(): Promise<{ publicKey: Buffer; secretKey: Buffer }> {
+  await sodium.ready;
+  const kp = sodium.crypto_sign_keypair();
+  return { publicKey: Buffer.from(kp.publicKey), secretKey: Buffer.from(kp.privateKey) };
 }
 
 /** Hash a public key (SHA-256 hex) — same as IdentityDatabase does. */
@@ -50,14 +49,14 @@ function hashPublicKey(publicKey: Buffer): string {
 }
 
 /** Create a temp dir with an identity database pre-populated. */
-function createTestSetup(): {
+async function createTestSetup(): Promise<{
   tmpDir: string;
   identityDb: IdentityDatabase;
   identityDbPath: string;
-} {
+}> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-netauth-'));
   const identityDbPath = path.join(tmpDir, 'identity.db');
-  const identityDb = new IdentityDatabase(identityDbPath);
+  const identityDb = await IdentityDatabase.open(identityDbPath);
   return { tmpDir, identityDb, identityDbPath };
 }
 
@@ -91,10 +90,10 @@ function getPort(server: http.Server): number {
 // ─── ChallengeStore ──────────────────────────────────────────────────
 
 describe('ChallengeStore', () => {
-  it('should issue a challenge with expected fields', () => {
+  it('should issue a challenge with expected fields', async () => {
     const store = new ChallengeStore(60_000);
     try {
-      const result = store.issue('test-id');
+      const result = await store.issue('test-id');
       expect(result.challenge_id).toBeTruthy();
       expect(result.challenge).toBeTruthy();
       expect(result.expires_in).toBe(60);
@@ -107,10 +106,10 @@ describe('ChallengeStore', () => {
     }
   });
 
-  it('should consume a valid challenge', () => {
+  it('should consume a valid challenge', async () => {
     const store = new ChallengeStore(60_000);
     try {
-      const issued = store.issue('test-id');
+      const issued = await store.issue('test-id');
       const { challenge, error } = store.consume(issued.challenge_id, 'test-id');
       expect(challenge).not.toBeNull();
       expect(error).toBeUndefined();
@@ -121,10 +120,10 @@ describe('ChallengeStore', () => {
     }
   });
 
-  it('should reject replay (second consumption)', () => {
+  it('should reject replay (second consumption)', async () => {
     const store = new ChallengeStore(60_000);
     try {
-      const issued = store.issue('test-id');
+      const issued = await store.issue('test-id');
       store.consume(issued.challenge_id, 'test-id');
       const { challenge, error } = store.consume(issued.challenge_id, 'test-id');
       expect(challenge).toBeNull();
@@ -137,7 +136,7 @@ describe('ChallengeStore', () => {
   it('should reject expired challenges', async () => {
     const store = new ChallengeStore(50); // 50ms TTL
     try {
-      const issued = store.issue('test-id');
+      const issued = await store.issue('test-id');
       // Wait for expiry
       await new Promise((r) => setTimeout(r, 100));
       const { challenge, error } = store.consume(issued.challenge_id, 'test-id');
@@ -148,10 +147,10 @@ describe('ChallengeStore', () => {
     }
   });
 
-  it('should reject identity mismatch', () => {
+  it('should reject identity mismatch', async () => {
     const store = new ChallengeStore(60_000);
     try {
-      const issued = store.issue('identity-a');
+      const issued = await store.issue('identity-a');
       const { challenge, error } = store.consume(issued.challenge_id, 'identity-b');
       expect(challenge).toBeNull();
       expect(error).toBe('Identity mismatch');
@@ -171,12 +170,12 @@ describe('ChallengeStore', () => {
     }
   });
 
-  it('should track active challenge count', () => {
+  it('should track active challenge count', async () => {
     const store = new ChallengeStore(60_000);
     try {
       expect(store.size).toBe(0);
-      store.issue('id-1');
-      store.issue('id-2');
+      await store.issue('id-1');
+      await store.issue('id-2');
       expect(store.size).toBe(2);
     } finally {
       store.close();
@@ -186,8 +185,8 @@ describe('ChallengeStore', () => {
   it('should clean up expired/used challenges', async () => {
     const store = new ChallengeStore(50); // 50ms TTL
     try {
-      store.issue('id-1');
-      const c2 = store.issue('id-2');
+      await store.issue('id-1');
+      const c2 = await store.issue('id-2');
       store.consume(c2.challenge_id, 'id-2'); // Use one
 
       await new Promise((r) => setTimeout(r, 100));
@@ -282,60 +281,60 @@ describe('SessionStore', () => {
 // ─── Ed25519 Sign/Verify ────────────────────────────────────────────
 
 describe('Ed25519 sign/verify', () => {
-  it('should sign and verify a message', () => {
-    const { publicKey, secretKey } = generateKeypair();
+  it('should sign and verify a message', async () => {
+    const { publicKey, secretKey } = await generateKeypair();
     const message = Buffer.from('test message to sign');
 
-    const signature = ed25519Sign(message, secretKey);
+    const signature = await ed25519Sign(message, secretKey);
     expect(signature.length).toBe(sodium.crypto_sign_BYTES);
 
-    const valid = ed25519Verify(signature, message, publicKey);
+    const valid = await ed25519Verify(signature, message, publicKey);
     expect(valid).toBe(true);
   });
 
-  it('should reject signature with wrong public key', () => {
-    const kp1 = generateKeypair();
-    const kp2 = generateKeypair();
+  it('should reject signature with wrong public key', async () => {
+    const kp1 = await generateKeypair();
+    const kp2 = await generateKeypair();
     const message = Buffer.from('test message');
 
-    const signature = ed25519Sign(message, kp1.secretKey);
-    const valid = ed25519Verify(signature, message, kp2.publicKey);
+    const signature = await ed25519Sign(message, kp1.secretKey);
+    const valid = await ed25519Verify(signature, message, kp2.publicKey);
     expect(valid).toBe(false);
   });
 
-  it('should reject tampered message', () => {
-    const { publicKey, secretKey } = generateKeypair();
+  it('should reject tampered message', async () => {
+    const { publicKey, secretKey } = await generateKeypair();
     const message = Buffer.from('original message');
 
-    const signature = ed25519Sign(message, secretKey);
+    const signature = await ed25519Sign(message, secretKey);
     const tampered = Buffer.from('tampered message');
-    const valid = ed25519Verify(signature, tampered, publicKey);
+    const valid = await ed25519Verify(signature, tampered, publicKey);
     expect(valid).toBe(false);
   });
 
-  it('should reject invalid signature length', () => {
-    const { publicKey } = generateKeypair();
+  it('should reject invalid signature length', async () => {
+    const { publicKey } = await generateKeypair();
     const message = Buffer.from('test message');
     const badSig = Buffer.alloc(32); // Wrong length
 
-    const valid = ed25519Verify(badSig, message, publicKey);
+    const valid = await ed25519Verify(badSig, message, publicKey);
     expect(valid).toBe(false);
   });
 
-  it('should reject invalid public key length', () => {
+  it('should reject invalid public key length', async () => {
     const message = Buffer.from('test message');
     const sig = Buffer.alloc(sodium.crypto_sign_BYTES);
     const badKey = Buffer.alloc(16); // Wrong length
 
-    const valid = ed25519Verify(sig, message, badKey);
+    const valid = await ed25519Verify(sig, message, badKey);
     expect(valid).toBe(false);
   });
 
-  it('should throw for invalid secret key length', () => {
+  it('should throw for invalid secret key length', async () => {
     const message = Buffer.from('test message');
     const badKey = Buffer.alloc(16);
 
-    expect(() => ed25519Sign(message, badKey)).toThrow('Secret key must be');
+    await expect(ed25519Sign(message, badKey)).rejects.toThrow('Secret key must be');
   });
 });
 
@@ -347,22 +346,22 @@ describe('NetworkAuthenticator', () => {
   let auth: NetworkAuthenticator;
   let identity1: { id: string; publicKey: Buffer; secretKey: Buffer };
 
-  beforeAll(() => {
-    const setup = createTestSetup();
+  beforeAll(async () => {
+    const setup = await createTestSetup();
     tmpDir = setup.tmpDir;
     identityDb = setup.identityDb;
 
     // Create an identity
-    const result = identityDb.createIdentity('agent-1', 'agent');
+    const result = await identityDb.createIdentity('agent-1', 'agent');
     const secretKey = Buffer.from(result.privateKey, 'base64');
-    const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    sodium.crypto_sign_ed25519_sk_to_pk(publicKey, secretKey);
+    await sodium.ready;
+    const publicKey = Buffer.from(sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(secretKey)));
 
     identity1 = { id: result.identity.id, publicKey, secretKey };
 
     // Create org and project, add identity as member
-    const org = identityDb.createOrg('test-org', identity1.id);
-    const project = identityDb.createProject(org.id, 'test-project', identity1.id);
+    const org = await identityDb.createOrg('test-org', identity1.id);
+    const project = await identityDb.createProject(org.id, 'test-project', identity1.id);
 
     auth = new NetworkAuthenticator(identityDb);
   });
@@ -377,28 +376,28 @@ describe('NetworkAuthenticator', () => {
     }
   });
 
-  it('should issue a challenge for a valid identity', () => {
-    const result = auth.issueChallenge(identity1.id);
+  it('should issue a challenge for a valid identity', async () => {
+    const result = await auth.issueChallenge(identity1.id);
     expect(result).not.toBeNull();
     expect(result!.challenge_id).toBeTruthy();
     expect(result!.challenge).toBeTruthy();
     expect(result!.expires_in).toBe(60);
   });
 
-  it('should return null for non-existent identity', () => {
-    const result = auth.issueChallenge('nonexistent-id');
+  it('should return null for non-existent identity', async () => {
+    const result = await auth.issueChallenge('nonexistent-id');
     expect(result).toBeNull();
   });
 
-  it('should verify a correctly signed challenge', () => {
-    const challenge = auth.issueChallenge(identity1.id)!;
+  it('should verify a correctly signed challenge', async () => {
+    const challenge = await auth.issueChallenge(identity1.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
 
     // Sign the nonce
-    const signature = ed25519Sign(nonce, identity1.secretKey);
+    const signature = await ed25519Sign(nonce, identity1.secretKey);
     const signatureBase64url = signature.toString('base64url');
 
-    const result = auth.verifyChallenge(
+    const result = await auth.verifyChallenge(
       challenge.challenge_id,
       identity1.id,
       signatureBase64url,
@@ -411,15 +410,15 @@ describe('NetworkAuthenticator', () => {
     expect(result.identity_id).toBe(identity1.id);
   });
 
-  it('should reject wrong key signature', () => {
-    const challenge = auth.issueChallenge(identity1.id)!;
+  it('should reject wrong key signature', async () => {
+    const challenge = await auth.issueChallenge(identity1.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
 
     // Sign with a DIFFERENT key
-    const wrongKeypair = generateKeypair();
-    const signature = ed25519Sign(nonce, wrongKeypair.secretKey);
+    const wrongKeypair = await generateKeypair();
+    const signature = await ed25519Sign(nonce, wrongKeypair.secretKey);
 
-    const result = auth.verifyChallenge(
+    const result = await auth.verifyChallenge(
       challenge.challenge_id,
       identity1.id,
       signature.toString('base64url'),
@@ -430,13 +429,13 @@ describe('NetworkAuthenticator', () => {
     expect(result.error).toContain('Public key does not match');
   });
 
-  it('should reject replay of used challenge', () => {
-    const challenge = auth.issueChallenge(identity1.id)!;
+  it('should reject replay of used challenge', async () => {
+    const challenge = await auth.issueChallenge(identity1.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
-    const signature = ed25519Sign(nonce, identity1.secretKey);
+    const signature = await ed25519Sign(nonce, identity1.secretKey);
 
     // First verify succeeds
-    auth.verifyChallenge(
+    await auth.verifyChallenge(
       challenge.challenge_id,
       identity1.id,
       signature.toString('base64url'),
@@ -444,7 +443,7 @@ describe('NetworkAuthenticator', () => {
     );
 
     // Second verify (replay) fails
-    const result = auth.verifyChallenge(
+    const result = await auth.verifyChallenge(
       challenge.challenge_id,
       identity1.id,
       signature.toString('base64url'),
@@ -459,14 +458,14 @@ describe('NetworkAuthenticator', () => {
     // Create authenticator with very short challenge TTL
     const shortAuth = new NetworkAuthenticator(identityDb, 50); // 50ms
     try {
-      const challenge = shortAuth.issueChallenge(identity1.id)!;
+      const challenge = await shortAuth.issueChallenge(identity1.id)!;
       const nonce = Buffer.from(challenge.challenge, 'base64url');
-      const signature = ed25519Sign(nonce, identity1.secretKey);
+      const signature = await ed25519Sign(nonce, identity1.secretKey);
 
       // Wait for expiry
       await new Promise((r) => setTimeout(r, 100));
 
-      const result = shortAuth.verifyChallenge(
+      const result = await shortAuth.verifyChallenge(
         challenge.challenge_id,
         identity1.id,
         signature.toString('base64url'),
@@ -480,12 +479,12 @@ describe('NetworkAuthenticator', () => {
     }
   });
 
-  it('should include org and project memberships in session', () => {
-    const challenge = auth.issueChallenge(identity1.id)!;
+  it('should include org and project memberships in session', async () => {
+    const challenge = await auth.issueChallenge(identity1.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
-    const signature = ed25519Sign(nonce, identity1.secretKey);
+    const signature = await ed25519Sign(nonce, identity1.secretKey);
 
-    const result = auth.verifyChallenge(
+    const result = await auth.verifyChallenge(
       challenge.challenge_id,
       identity1.id,
       signature.toString('base64url'),
@@ -507,12 +506,12 @@ describe('NetworkAuthenticator', () => {
     expect(session.session!.projects[projectIds[0]]).toBe('admin');
   });
 
-  it('should validate session tokens', () => {
-    const challenge = auth.issueChallenge(identity1.id)!;
+  it('should validate session tokens', async () => {
+    const challenge = await auth.issueChallenge(identity1.id)!;
     const nonce = Buffer.from(challenge.challenge, 'base64url');
-    const signature = ed25519Sign(nonce, identity1.secretKey);
+    const signature = await ed25519Sign(nonce, identity1.secretKey);
 
-    const verifyResult = auth.verifyChallenge(
+    const verifyResult = await auth.verifyChallenge(
       challenge.challenge_id,
       identity1.id,
       signature.toString('base64url'),
@@ -543,20 +542,20 @@ describe('Server — /v1/auth/* endpoints', () => {
 
   beforeAll(async () => {
     // Create identity database with a test identity
-    const setup = createTestSetup();
+    const setup = await createTestSetup();
     tmpDir = setup.tmpDir;
     identityDb = setup.identityDb;
     identityDbPath = setup.identityDbPath;
 
-    const result = identityDb.createIdentity('server-agent', 'agent');
+    const result = await identityDb.createIdentity('server-agent', 'agent');
     const secretKey = Buffer.from(result.privateKey, 'base64');
-    const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    sodium.crypto_sign_ed25519_sk_to_pk(publicKey, secretKey);
+    await sodium.ready;
+    const publicKey = Buffer.from(sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(secretKey)));
     identity1 = { id: result.identity.id, publicKey, secretKey };
 
     // Create org + project memberships
-    const org = identityDb.createOrg('srv-org', identity1.id);
-    identityDb.createProject(org.id, 'srv-project', identity1.id);
+    const org = await identityDb.createOrg('srv-org', identity1.id);
+    await identityDb.createProject(org.id, 'srv-project', identity1.id);
 
     // Start server
     const srvSetup = createTmpConfig(identityDbPath);
@@ -625,7 +624,7 @@ describe('Server — /v1/auth/* endpoints', () => {
     const challengeId = challengeRes.body.challenge_id as string;
 
     // Step 2: Sign the challenge
-    const signature = ed25519Sign(nonce, identity1.secretKey);
+    const signature = await ed25519Sign(nonce, identity1.secretKey);
 
     // Step 3: Verify
     const verifyRes = await request(clientCfg, 'POST', '/v1/auth/verify', {
@@ -652,8 +651,8 @@ describe('Server — /v1/auth/* endpoints', () => {
     const challengeId = challengeRes.body.challenge_id as string;
 
     // Sign with wrong key
-    const wrongKeypair = generateKeypair();
-    const signature = ed25519Sign(nonce, wrongKeypair.secretKey);
+    const wrongKeypair = await generateKeypair();
+    const signature = await ed25519Sign(nonce, wrongKeypair.secretKey);
 
     const verifyRes = await request(clientCfg, 'POST', '/v1/auth/verify', {
       challenge_id: challengeId,
@@ -673,7 +672,7 @@ describe('Server — /v1/auth/* endpoints', () => {
 
     const nonce = Buffer.from(challengeRes.body.challenge as string, 'base64url');
     const challengeId = challengeRes.body.challenge_id as string;
-    const signature = ed25519Sign(nonce, identity1.secretKey);
+    const signature = await ed25519Sign(nonce, identity1.secretKey);
 
     // First verify succeeds
     const verifyRes1 = await request(clientCfg, 'POST', '/v1/auth/verify', {
@@ -700,7 +699,7 @@ describe('Server — /v1/auth/* endpoints', () => {
       identity_id: identity1.id,
     });
     const nonce = Buffer.from(challengeRes.body.challenge as string, 'base64url');
-    const signature = ed25519Sign(nonce, identity1.secretKey);
+    const signature = await ed25519Sign(nonce, identity1.secretKey);
 
     const verifyRes = await request(clientCfg, 'POST', '/v1/auth/verify', {
       challenge_id: challengeRes.body.challenge_id as string,
@@ -762,16 +761,16 @@ describe('Server — /v1/auth/* endpoints', () => {
 
   it('should rate-limit failed verification attempts', async () => {
     // Create a separate server with aggressive rate limiting for this test
-    const setup2 = createTestSetup();
+    const setup2 = await createTestSetup();
     const srvSetup2 = createTmpConfig(setup2.identityDbPath, {
       rateLimitConfig: { maxFailures: 3, windowMs: 60_000, lockoutMs: 300_000 },
     });
 
     // Create an identity in the new DB
-    const idResult = setup2.identityDb.createIdentity('rate-test', 'agent');
+    const idResult = await setup2.identityDb.createIdentity('rate-test', 'agent');
     const sk = Buffer.from(idResult.privateKey, 'base64');
-    const pk = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    sodium.crypto_sign_ed25519_sk_to_pk(pk, sk);
+    await sodium.ready;
+    const pk = Buffer.from(sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(sk)));
 
     const srv2 = (await createVaultServer(srvSetup2.config)) as http.Server;
     const cfg2: ClientConfig = {
@@ -781,7 +780,7 @@ describe('Server — /v1/auth/* endpoints', () => {
     };
 
     try {
-      const wrongKeypair = generateKeypair();
+      const wrongKeypair = await generateKeypair();
 
       // Generate 3 failed attempts
       for (let i = 0; i < 3; i++) {
@@ -789,7 +788,7 @@ describe('Server — /v1/auth/* endpoints', () => {
           identity_id: idResult.identity.id,
         });
         const nonce = Buffer.from(challengeRes.body.challenge as string, 'base64url');
-        const wrongSig = ed25519Sign(nonce, wrongKeypair.secretKey);
+        const wrongSig = await ed25519Sign(nonce, wrongKeypair.secretKey);
 
         await request(cfg2, 'POST', '/v1/auth/verify', {
           challenge_id: challengeRes.body.challenge_id,

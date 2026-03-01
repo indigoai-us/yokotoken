@@ -27,7 +27,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import sodium from 'sodium-native';
+import sodium from 'libsodium-wrappers-sumo';
 import crypto from 'node:crypto';
 
 const PASSPHRASE = 'test-network-audit-passphrase-2026';
@@ -78,12 +78,12 @@ function clientFor(server: http.Server, token?: string): ClientConfig {
 /**
  * Create an identity, returning its ID, name, and keypair.
  */
-function createTestIdentity(
+async function createTestIdentity(
   idb: IdentityDatabase,
   name: string,
   type: 'human' | 'agent' = 'agent',
 ) {
-  const result = idb.createIdentity(name, type);
+  const result = await idb.createIdentity(name, type);
   return {
     id: result.identity.id,
     name: result.identity.name,
@@ -95,11 +95,11 @@ function createTestIdentity(
 /**
  * Sign a challenge nonce with a private key.
  */
-function signChallenge(nonceBase64url: string, secretKey: Buffer): string {
+async function signChallenge(nonceBase64url: string, secretKey: Buffer): Promise<string> {
   const nonce = Buffer.from(nonceBase64url, 'base64url');
-  const signature = Buffer.alloc(sodium.crypto_sign_BYTES);
-  sodium.crypto_sign_detached(signature, nonce, secretKey);
-  return signature.toString('base64url');
+  await sodium.ready;
+  const signature = sodium.crypto_sign_detached(new Uint8Array(nonce), new Uint8Array(secretKey));
+  return Buffer.from(signature).toString('base64url');
 }
 
 // ─── AuditLogger.logNetworkEvent — unit tests ────────────────────────
@@ -491,17 +491,17 @@ describe('Server audit — network auth events', () => {
     auditLogPath = result.auditLogPath;
 
     // Initialize vault
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('acme/db/password', 'secret-value');
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('acme/db/password', 'secret-value');
+    await vault.close();
 
     // Create an identity for testing
-    const idb = new IdentityDatabase(config.identityDbPath!);
-    testIdentity = createTestIdentity(idb, 'test-agent');
+    const idb = await IdentityDatabase.open(config.identityDbPath!);
+    testIdentity = await createTestIdentity(idb, 'test-agent');
 
     // Create an org and add the identity
-    const org = idb.createOrg('test-org', testIdentity.id);
+    const org = await idb.createOrg('test-org', testIdentity.id);
     idb.close();
 
     server = (await createVaultServer(config)) as http.Server;
@@ -547,7 +547,7 @@ describe('Server audit — network auth events', () => {
     const challengeNonce = challengeRes.body.challenge;
 
     // Sign and verify
-    const signature = signChallenge(challengeNonce, testIdentity.privateKey);
+    const signature = await signChallenge(challengeNonce, testIdentity.privateKey);
 
     const verifyRes = await request(client, 'POST', '/v1/auth/verify', {
       challenge_id: challengeId,
@@ -624,14 +624,14 @@ describe('Server audit — access request lifecycle', () => {
     auditLogPath = result.auditLogPath;
 
     // Initialize vault
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     // Create identity and org
-    const idb = new IdentityDatabase(config.identityDbPath!);
-    testIdentity = createTestIdentity(idb, 'requesting-agent');
-    const org = idb.createOrg('target-org');
+    const idb = await IdentityDatabase.open(config.identityDbPath!);
+    testIdentity = await createTestIdentity(idb, 'requesting-agent');
+    const org = await idb.createOrg('target-org');
     // Don't add identity as member yet — they need to request access
     idb.close();
 

@@ -7,13 +7,13 @@
  * - verifyChallenge: validates Ed25519 signature, creates session token with identity metadata
  * - SessionStore: in-memory store for session tokens with 1-hour TTL
  *
- * Challenge nonces are single-use — replaying a signed challenge returns 401.
- * Session tokens include identity_id, org memberships, and project memberships.
+ * Uses libsodium-wrappers-sumo (WASM) for Ed25519 operations.
  */
 
-import sodium from 'sodium-native';
+import sodium from 'libsodium-wrappers-sumo';
 import crypto from 'node:crypto';
 import type { IdentityDatabase, MemberRole } from './identity.js';
+import { ensureSodium } from './crypto.js';
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -82,12 +82,6 @@ const CHALLENGE_NONCE_BYTES = 32;
 
 // ─── ChallengeStore ─────────────────────────────────────────────────
 
-/**
- * In-memory store for challenge nonces.
- *
- * Challenges are single-use and expire after a configurable TTL (default 60s).
- * A periodic cleanup runs to evict expired challenges.
- */
 export class ChallengeStore {
   private challenges: Map<string, Challenge> = new Map();
   private ttlMs: number;
@@ -95,20 +89,16 @@ export class ChallengeStore {
 
   constructor(ttlMs: number = DEFAULT_CHALLENGE_TTL_MS) {
     this.ttlMs = ttlMs;
-    // Run cleanup every 30 seconds
     this.cleanupTimer = setInterval(() => this.cleanup(), 30_000);
     this.cleanupTimer.unref();
   }
 
   /**
    * Issue a new challenge for an identity.
-   *
-   * @param identityId - The identity requesting authentication.
-   * @returns The challenge response to send to the client.
    */
-  issue(identityId: string): ChallengeResponse {
-    const nonce = Buffer.alloc(CHALLENGE_NONCE_BYTES);
-    sodium.randombytes_buf(nonce);
+  async issue(identityId: string): Promise<ChallengeResponse> {
+    await ensureSodium();
+    const nonce = Buffer.from(sodium.randombytes_buf(CHALLENGE_NONCE_BYTES));
 
     const challengeId = crypto.randomBytes(16).toString('hex');
 
@@ -131,13 +121,7 @@ export class ChallengeStore {
   }
 
   /**
-   * Consume a challenge by ID. Returns the challenge if valid, null otherwise.
-   *
-   * A challenge is invalid if:
-   * - It does not exist
-   * - It has already been used (replay protection)
-   * - It has expired
-   * - The identity_id does not match
+   * Consume a challenge by ID.
    */
   consume(challengeId: string, identityId: string): { challenge: Challenge | null; error?: string } {
     const challenge = this.challenges.get(challengeId);
@@ -151,7 +135,6 @@ export class ChallengeStore {
     }
 
     if (Date.now() > challenge.expires_at) {
-      // Clean up the expired challenge
       this.challenges.delete(challengeId);
       return { challenge: null, error: 'Challenge expired' };
     }
@@ -160,15 +143,10 @@ export class ChallengeStore {
       return { challenge: null, error: 'Identity mismatch' };
     }
 
-    // Mark as used (single-use)
     challenge.used = true;
-
     return { challenge };
   }
 
-  /**
-   * Remove expired and used challenges.
-   */
   cleanup(): void {
     const now = Date.now();
     for (const [id, challenge] of this.challenges) {
@@ -178,9 +156,6 @@ export class ChallengeStore {
     }
   }
 
-  /**
-   * Get the number of active (non-expired, non-used) challenges.
-   */
   get size(): number {
     let count = 0;
     const now = Date.now();
@@ -192,9 +167,6 @@ export class ChallengeStore {
     return count;
   }
 
-  /**
-   * Close the store and stop the cleanup timer.
-   */
   close(): void {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
@@ -206,12 +178,6 @@ export class ChallengeStore {
 
 // ─── SessionStore ───────────────────────────────────────────────────
 
-/**
- * In-memory store for session tokens.
- *
- * Session tokens are opaque, short-lived (1-hour TTL by default), and
- * include identity metadata (org/project memberships).
- */
 export class SessionStore {
   private sessions: Map<string, SessionToken> = new Map();
   private ttlMs: number;
@@ -219,19 +185,10 @@ export class SessionStore {
 
   constructor(ttlMs: number = DEFAULT_SESSION_TTL_MS) {
     this.ttlMs = ttlMs;
-    // Run cleanup every 5 minutes
     this.cleanupTimer = setInterval(() => this.cleanup(), 5 * 60_000);
     this.cleanupTimer.unref();
   }
 
-  /**
-   * Create a new session token for an identity.
-   *
-   * @param identityId - The authenticated identity.
-   * @param orgs - Org memberships: { org_id: role }.
-   * @param projects - Project memberships: { project_id: role }.
-   * @returns The created session token.
-   */
   create(
     identityId: string,
     orgs: Record<string, MemberRole>,
@@ -252,16 +209,9 @@ export class SessionStore {
     };
 
     this.sessions.set(tokenHash, session);
-
     return session;
   }
 
-  /**
-   * Validate a session token.
-   *
-   * @param rawToken - The raw token string from the Bearer header.
-   * @returns Validation result with session metadata if valid.
-   */
   validate(rawToken: string): SessionValidationResult {
     const tokenHash = crypto.createHash('sha256').update(rawToken, 'utf-8').digest('hex');
     const session = this.sessions.get(tokenHash);
@@ -278,20 +228,11 @@ export class SessionStore {
     return { valid: true, session };
   }
 
-  /**
-   * Revoke a session token.
-   */
   revoke(rawToken: string): boolean {
     const tokenHash = crypto.createHash('sha256').update(rawToken, 'utf-8').digest('hex');
     return this.sessions.delete(tokenHash);
   }
 
-  /**
-   * Revoke all sessions belonging to a specific identity.
-   *
-   * Used during key rotation to invalidate sessions issued with the old key.
-   * Returns the number of sessions revoked.
-   */
   revokeSessionsForIdentity(identityId: string): number {
     let count = 0;
     for (const [hash, session] of this.sessions) {
@@ -303,9 +244,6 @@ export class SessionStore {
     return count;
   }
 
-  /**
-   * Remove expired sessions.
-   */
   cleanup(): void {
     const now = Date.now();
     for (const [hash, session] of this.sessions) {
@@ -315,9 +253,6 @@ export class SessionStore {
     }
   }
 
-  /**
-   * Get the number of active (non-expired) sessions.
-   */
   get size(): number {
     let count = 0;
     const now = Date.now();
@@ -329,9 +264,6 @@ export class SessionStore {
     return count;
   }
 
-  /**
-   * Close the store and stop the cleanup timer.
-   */
   close(): void {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
@@ -345,32 +277,27 @@ export class SessionStore {
 
 /**
  * Sign a message with an Ed25519 private key.
- *
- * @param message - The message bytes to sign.
- * @param secretKey - The 64-byte Ed25519 secret key.
- * @returns The detached signature (64 bytes).
  */
-export function ed25519Sign(message: Buffer, secretKey: Buffer): Buffer {
+export async function ed25519Sign(message: Buffer, secretKey: Buffer): Promise<Buffer> {
+  await ensureSodium();
   if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
     throw new Error(
       `Secret key must be ${sodium.crypto_sign_SECRETKEYBYTES} bytes, got ${secretKey.length}`,
     );
   }
 
-  const signature = Buffer.alloc(sodium.crypto_sign_BYTES);
-  sodium.crypto_sign_detached(signature, message, secretKey);
-  return signature;
+  const signature = sodium.crypto_sign_detached(
+    new Uint8Array(message),
+    new Uint8Array(secretKey),
+  );
+  return Buffer.from(signature);
 }
 
 /**
  * Verify an Ed25519 detached signature.
- *
- * @param signature - The 64-byte detached signature.
- * @param message - The original message bytes.
- * @param publicKey - The 32-byte Ed25519 public key.
- * @returns true if the signature is valid.
  */
-export function ed25519Verify(signature: Buffer, message: Buffer, publicKey: Buffer): boolean {
+export async function ed25519Verify(signature: Buffer, message: Buffer, publicKey: Buffer): Promise<boolean> {
+  await ensureSodium();
   if (publicKey.length !== sodium.crypto_sign_PUBLICKEYBYTES) {
     return false;
   }
@@ -379,7 +306,11 @@ export function ed25519Verify(signature: Buffer, message: Buffer, publicKey: Buf
   }
 
   try {
-    return sodium.crypto_sign_verify_detached(signature, message, publicKey);
+    return sodium.crypto_sign_verify_detached(
+      new Uint8Array(signature),
+      new Uint8Array(message),
+      new Uint8Array(publicKey),
+    );
   } catch {
     return false;
   }
@@ -387,10 +318,6 @@ export function ed25519Verify(signature: Buffer, message: Buffer, publicKey: Buf
 
 // ─── NetworkAuthenticator ───────────────────────────────────────────
 
-/**
- * High-level authenticator that ties together challenges, identity lookup,
- * Ed25519 verification, and session creation.
- */
 export class NetworkAuthenticator {
   private challengeStore: ChallengeStore;
   private sessionStore: SessionStore;
@@ -408,10 +335,8 @@ export class NetworkAuthenticator {
 
   /**
    * Issue a challenge for an identity.
-   *
-   * Validates the identity exists before issuing. Returns null if identity not found.
    */
-  issueChallenge(identityId: string): ChallengeResponse | null {
+  async issueChallenge(identityId: string): Promise<ChallengeResponse | null> {
     const identity = this.identityDb.getIdentity(identityId);
     if (!identity) {
       return null;
@@ -422,34 +347,13 @@ export class NetworkAuthenticator {
 
   /**
    * Verify a challenge response and create a session token.
-   *
-   * Flow:
-   * 1. Consume the challenge (validates existence, expiry, single-use)
-   * 2. Look up the identity and its public key hash
-   * 3. Recover the public key from the signature (we can't do this with detached sigs)
-   *    Instead: we need the identity's public key. Since we only store the hash,
-   *    the client must provide a way to verify. We match by:
-   *    - Looking up the identity by ID
-   *    - Getting its public_key_hash
-   *    - The client provides their public key alongside the signature
-   *    OR we need to store the public key itself (not just hash).
-   *
-   *    DESIGN DECISION: We add a `getIdentityByPublicKeyHash` query and require
-   *    the client to also send their public key. We verify the public key hash
-   *    matches the stored one, then verify the signature with that public key.
-   *
-   * @param challengeId - The challenge ID to verify.
-   * @param identityId - The identity claiming to own the key.
-   * @param signatureBase64 - Base64url-encoded Ed25519 signature.
-   * @param publicKeyBase64 - Base64-encoded Ed25519 public key.
-   * @returns Result with session token on success, error on failure.
    */
-  verifyChallenge(
+  async verifyChallenge(
     challengeId: string,
     identityId: string,
     signatureBase64: string,
     publicKeyBase64: string,
-  ): VerifyChallengeResult {
+  ): Promise<VerifyChallengeResult> {
     // 1. Consume the challenge
     const { challenge, error } = this.challengeStore.consume(challengeId, identityId);
     if (!challenge || error) {
@@ -462,7 +366,9 @@ export class NetworkAuthenticator {
       return { success: false, error: 'Identity not found' };
     }
 
-    // 3. Verify the public key matches the stored hash (or old key within grace period)
+    // 3. Verify the public key matches the stored hash
+    await ensureSodium();
+
     let publicKey: Buffer;
     try {
       publicKey = Buffer.from(publicKeyBase64, 'base64');
@@ -491,7 +397,7 @@ export class NetworkAuthenticator {
       return { success: false, error: 'Invalid signature encoding' };
     }
 
-    const valid = ed25519Verify(signature, challenge.nonce, publicKey);
+    const valid = await ed25519Verify(signature, challenge.nonce, publicKey);
     if (!valid) {
       return { success: false, error: 'Signature verification failed' };
     }
@@ -510,16 +416,10 @@ export class NetworkAuthenticator {
     };
   }
 
-  /**
-   * Validate a session token.
-   */
   validateSession(rawToken: string): SessionValidationResult {
     return this.sessionStore.validate(rawToken);
   }
 
-  /**
-   * Get identity memberships (org + project) for session token metadata.
-   */
   private getIdentityMemberships(identityId: string): {
     orgs: Record<string, MemberRole>;
     projects: Record<string, MemberRole>;
@@ -527,14 +427,12 @@ export class NetworkAuthenticator {
     const orgs: Record<string, MemberRole> = {};
     const projects: Record<string, MemberRole> = {};
 
-    // Get all orgs and check membership
     const allOrgs = this.identityDb.listOrgs();
     for (const org of allOrgs) {
       const role = this.identityDb.getOrgRole(org.id, identityId);
       if (role) {
         orgs[org.id] = role;
 
-        // Get all projects in this org and check membership
         const orgProjects = this.identityDb.listProjects(org.id);
         for (const project of orgProjects) {
           const projectRole = this.identityDb.getProjectRole(project.id, identityId);
@@ -548,23 +446,14 @@ export class NetworkAuthenticator {
     return { orgs, projects };
   }
 
-  /**
-   * Get the challenge store (for testing).
-   */
   get challenges(): ChallengeStore {
     return this.challengeStore;
   }
 
-  /**
-   * Get the session store (for testing).
-   */
   get sessions(): SessionStore {
     return this.sessionStore;
   }
 
-  /**
-   * Close all stores.
-   */
   close(): void {
     this.challengeStore.close();
     this.sessionStore.close();

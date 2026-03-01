@@ -407,10 +407,10 @@ describe('Server audit — secret operations', () => {
 
   beforeAll(async () => {
     ({ tmpDir, config, auditLogPath } = createTmpConfig());
-    const vault = new VaultEngine(config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('existing/secret', 'value-123');
-    vault.close();
+    const vault = await VaultEngine.open(config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('existing/secret', 'value-123');
+    await vault.close();
 
     server = await createVaultServer(config) as http.Server;
 
@@ -547,9 +547,9 @@ describe('Server audit — auth failures', () => {
     tmpDir = result.tmpDir;
     auditLogPath = result.auditLogPath;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
   });
@@ -617,9 +617,9 @@ describe('Server audit — immutability', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
   });
@@ -684,10 +684,10 @@ describe('Server audit — managed token name tracking', () => {
     tmpDir = result.tmpDir;
     auditLogPath = result.auditLogPath;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('test/secret', 'value');
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('test/secret', 'value');
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
 

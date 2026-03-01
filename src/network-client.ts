@@ -248,7 +248,8 @@ export class NetworkVaultClient {
     }
 
     // Dynamically import sodium for Ed25519 operations
-    const sodium = (await import('sodium-native')).default;
+    const sodium = (await import('libsodium-wrappers-sumo')).default;
+    await sodium.ready;
 
     if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
       throw new NetworkClientError(
@@ -258,8 +259,7 @@ export class NetworkVaultClient {
     }
 
     // Extract public key from private key
-    const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    sodium.crypto_sign_ed25519_sk_to_pk(publicKey, secretKey);
+    const publicKey = Buffer.from(sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(secretKey)));
     const publicKeyBase64 = publicKey.toString('base64');
 
     try {
@@ -284,8 +284,9 @@ export class NetworkVaultClient {
       const challengeId = challengeRes.body.challenge_id as string;
 
       // Step 2: Sign the challenge nonce
-      const signature = Buffer.alloc(sodium.crypto_sign_BYTES);
-      sodium.crypto_sign_detached(signature, challengeNonce, secretKey);
+      const signature = Buffer.from(
+        sodium.crypto_sign_detached(new Uint8Array(challengeNonce), new Uint8Array(secretKey))
+      );
       const signatureBase64url = signature.toString('base64url');
 
       // Step 3: Verify and get session token
@@ -317,7 +318,7 @@ export class NetworkVaultClient {
       return sessionToken;
     } finally {
       // Zero out the secret key
-      sodium.sodium_memzero(secretKey);
+      sodium.memzero(secretKey);
     }
   }
 

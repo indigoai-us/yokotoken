@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import sodium from 'sodium-native';
+import sodium from 'libsodium-wrappers-sumo';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -37,11 +37,10 @@ const PASSPHRASE = 'test-network-passphrase-2026';
 // ─── Helpers ────────────────────────────────────────────────────────
 
 /** Generate an Ed25519 keypair. */
-function generateKeypair(): { publicKey: Buffer; secretKey: Buffer } {
-  const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-  const secretKey = Buffer.alloc(sodium.crypto_sign_SECRETKEYBYTES);
-  sodium.crypto_sign_keypair(publicKey, secretKey);
-  return { publicKey, secretKey };
+async function generateKeypair(): Promise<{ publicKey: Buffer; secretKey: Buffer }> {
+  await sodium.ready;
+  const kp = sodium.crypto_sign_keypair();
+  return { publicKey: Buffer.from(kp.publicKey), secretKey: Buffer.from(kp.privateKey) };
 }
 
 /** Create a temp directory for test artifacts. */
@@ -50,18 +49,18 @@ function createTmpDir(prefix: string): string {
 }
 
 /** Create a test identity database with one identity. */
-function createIdentityDb(tmpDir: string): {
+async function createIdentityDb(tmpDir: string): Promise<{
   identityDbPath: string;
   identityDb: IdentityDatabase;
   identityId: string;
   publicKey: Buffer;
   secretKey: Buffer;
-} {
+}> {
   const identityDbPath = path.join(tmpDir, 'identity.db');
-  const identityDb = new IdentityDatabase(identityDbPath);
+  const identityDb = await IdentityDatabase.open(identityDbPath);
 
   // Create a keypair and identity manually (so we have the secret key for signing)
-  const { publicKey, secretKey } = generateKeypair();
+  const { publicKey, secretKey } = await generateKeypair();
   const publicKeyHash = crypto.createHash('sha256').update(publicKey).digest('hex');
 
   // Insert identity directly (createIdentity generates its own keypair internally)
@@ -69,9 +68,11 @@ function createIdentityDb(tmpDir: string): {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const db = (identityDb as any).db;
   const id = crypto.randomBytes(16).toString('hex');
-  db.prepare(
+  db.run(
     'INSERT INTO identities (id, name, type, public_key_hash) VALUES (?, ?, ?, ?)',
-  ).run(id, 'test-agent', 'agent', publicKeyHash);
+    [id, 'test-agent', 'agent', publicKeyHash],
+  );
+  identityDb.persist();
 
   return { identityDbPath, identityDb, identityId: id, publicKey, secretKey };
 }
@@ -122,7 +123,7 @@ async function authenticateWithIdentity(
   const challengeNonce = Buffer.from(challengeRes.body.challenge as string, 'base64url');
 
   // Step 2: Sign the challenge
-  const signature = ed25519Sign(challengeNonce, secretKey);
+  const signature = await ed25519Sign(challengeNonce, secretKey);
 
   // Step 3: Verify the challenge
   const verifyRes = await request(
@@ -146,29 +147,23 @@ async function authenticateWithIdentity(
 // ─── Network mode validation tests ────────────────────────────────
 
 describe('Network mode — startup validation', () => {
-  it('should refuse to start in network mode with --insecure', () => {
+  it('should refuse to start in network mode with --insecure', async () => {
     const tmpDir = createTmpDir('net-insecure');
-    const { identityDbPath, identityDb } = createIdentityDb(tmpDir);
+    const { identityDbPath, identityDb } = await createIdentityDb(tmpDir);
 
-    let thrownError: Error | null = null;
     try {
       const config = createLocalConfig(tmpDir, {
         network: true,
         insecure: true,
         identityDbPath,
       });
-      createVaultServer(config);
-    } catch (err) {
-      thrownError = err as Error;
+      await expect(createVaultServer(config)).rejects.toThrow('Network mode requires TLS');
     } finally {
       identityDb.close();
     }
-
-    expect(thrownError).toBeTruthy();
-    expect(thrownError!.message).toContain('Network mode requires TLS');
   });
 
-  it('should refuse to start in network mode without identity database', () => {
+  it('should refuse to start in network mode without identity database', async () => {
     const tmpDir = createTmpDir('net-no-iddb');
 
     // Generate self-signed certs for TLS
@@ -188,21 +183,13 @@ describe('Network mode — startup validation', () => {
       identityDbPath: path.join(tmpDir, 'nonexistent', 'identity.db'),
     };
 
-    let thrownError: Error | null = null;
-    try {
-      createVaultServer(config);
-    } catch (err) {
-      thrownError = err as Error;
-    }
-
-    expect(thrownError).toBeTruthy();
-    expect(thrownError!.message).toContain('Network mode requires an identity database');
+    await expect(createVaultServer(config)).rejects.toThrow('Network mode requires an identity database');
   });
 
-  it('should refuse to start in network mode with empty identity database', () => {
+  it('should refuse to start in network mode with empty identity database', async () => {
     const tmpDir = createTmpDir('net-empty-iddb');
     const identityDbPath = path.join(tmpDir, 'identity.db');
-    const identityDb = new IdentityDatabase(identityDbPath);
+    const identityDb = await IdentityDatabase.open(identityDbPath);
 
     const certData = generateSelfSignedCert();
 
@@ -219,17 +206,11 @@ describe('Network mode — startup validation', () => {
       identityDbPath,
     };
 
-    let thrownError: Error | null = null;
     try {
-      createVaultServer(config);
-    } catch (err) {
-      thrownError = err as Error;
+      await expect(createVaultServer(config)).rejects.toThrow('Network mode requires at least one identity');
     } finally {
       identityDb.close();
     }
-
-    expect(thrownError).toBeTruthy();
-    expect(thrownError!.message).toContain('Network mode requires at least one identity');
   });
 });
 
@@ -300,7 +281,7 @@ describe('Network mode — server behavior', () => {
 
   beforeAll(async () => {
     tmpDir = createTmpDir('net-server');
-    const idSetup = createIdentityDb(tmpDir);
+    const idSetup = await createIdentityDb(tmpDir);
     identityId = idSetup.identityId;
     publicKey = idSetup.publicKey;
     secretKey = idSetup.secretKey;
@@ -518,7 +499,7 @@ describe('Custom bind address', () => {
     try { if (server) server.close(); server = null; } catch { /* ok */ }
 
     tmpDir = createTmpDir('bind-net');
-    const idSetup = createIdentityDb(tmpDir);
+    const idSetup = await createIdentityDb(tmpDir);
     identityDb = idSetup.identityDb;
 
     const certData = generateSelfSignedCert();
@@ -558,7 +539,7 @@ describe('Custom TLS certificate paths', () => {
 
   it('should use custom cert/key files when provided', async () => {
     const tmpDir = createTmpDir('custom-tls');
-    const idSetup = createIdentityDb(tmpDir);
+    const idSetup = await createIdentityDb(tmpDir);
     identityDb = idSetup.identityDb;
 
     // Generate and write cert/key to files
@@ -611,7 +592,7 @@ describe('Network mode — vault operations with session auth', () => {
 
   beforeAll(async () => {
     tmpDir = createTmpDir('net-ops');
-    const idSetup = createIdentityDb(tmpDir);
+    const idSetup = await createIdentityDb(tmpDir);
     identityId = idSetup.identityId;
     publicKey = idSetup.publicKey;
     secretKey = idSetup.secretKey;

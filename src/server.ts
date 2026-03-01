@@ -141,9 +141,9 @@ function resetIdleTimer(state: ServerState): void {
   state.lastActivity = Date.now();
 
   if (state.vault.isUnlocked && state.idleTimeoutMs > 0) {
-    state.idleTimer = setTimeout(() => {
+    state.idleTimer = setTimeout(async () => {
       if (state.vault.isUnlocked) {
-        state.vault.lock();
+        await state.vault.lock();
         process.stderr.write('[hq-vault] Auto-locked after idle timeout\n');
       }
     }, state.idleTimeoutMs);
@@ -258,7 +258,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           return;
         }
 
-        const challenge = state.networkAuth.issueChallenge(identityId);
+        const challenge = await state.networkAuth.issueChallenge(identityId);
         if (!challenge) {
           // Don't reveal whether the identity exists — just return a generic error
           // But rate-limit to prevent enumeration
@@ -316,7 +316,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           return;
         }
 
-        const result = state.networkAuth.verifyChallenge(
+        const result = await state.networkAuth.verifyChallenge(
           challengeId,
           identityId,
           signature,
@@ -565,7 +565,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
 
         if (state.vault.isInitialized && force) {
           // Close the existing vault and token manager DB before deleting files
-          state.vault.close();
+          await state.vault.close();
           try { state.tokenDb.close(); } catch { /* ok */ }
           if (fs.existsSync(config.vaultPath)) {
             fs.unlinkSync(config.vaultPath);
@@ -575,13 +575,13 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
             if (fs.existsSync(walPath)) fs.unlinkSync(walPath);
             if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
           }
-          state.vault = new VaultEngine(config.vaultPath);
+          state.vault = await VaultEngine.open(config.vaultPath);
           // Recreate token manager with fresh DB connection
-          state.tokenDb = new VaultDatabase(config.vaultPath);
+          state.tokenDb = await VaultDatabase.open(config.vaultPath);
           state.tokenManager = new TokenManager(state.tokenDb);
         }
 
-        state.vault.init(passphrase);
+        await state.vault.init(passphrase);
         resetIdleTimer(state);
         sendJson(res, 200, {
           ok: true,
@@ -613,7 +613,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         }
 
         try {
-          state.vault.unlock(passphrase);
+          await state.vault.unlock(passphrase);
           resetIdleTimer(state);
           sendJson(res, 200, { ok: true, message: 'Vault unlocked' });
         } catch {
@@ -628,7 +628,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
           clearTimeout(state.idleTimer);
           state.idleTimer = null;
         }
-        state.vault.lock();
+        await state.vault.lock();
         sendJson(res, 200, { ok: true, message: 'Vault locked' });
         return;
       }
@@ -694,7 +694,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         if (body.rotation_interval && typeof body.rotation_interval === 'string') metadata.rotation_interval = body.rotation_interval;
 
         try {
-          state.vault.store(secretPath, value, metadata);
+          await state.vault.store(secretPath, value, metadata);
           resetIdleTimer(state);
           // Audit: log store operation (never log the secret value)
           state.auditLogger.logAccess('secret.store', {
@@ -851,7 +851,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         }
 
         try {
-          const entry = state.vault.get(secretPath);
+          const entry = await state.vault.get(secretPath);
           resetIdleTimer(state);
           if (!entry) {
             sendJson(res, 404, { error: `Secret not found: ${secretPath}` });
@@ -1023,7 +1023,7 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
 
       // POST /v1/shutdown — Graceful shutdown
       if (req.method === 'POST' && pathname === '/v1/shutdown') {
-        state.vault.lock();
+        await state.vault.lock();
         sendJson(res, 200, { ok: true, message: 'Server shutting down' });
         // Give response time to flush, then shut down
         setTimeout(() => {
@@ -1051,7 +1051,7 @@ let server: https.Server | http.Server;
  * By default uses HTTPS with auto-generated self-signed certificates.
  * Pass `insecure: true` in config for plain HTTP (testing only).
  */
-export function createVaultServer(config: ServerConfig): Promise<https.Server | http.Server> {
+export async function createVaultServer(config: ServerConfig): Promise<https.Server | http.Server> {
   const isNetwork = config.network === true;
 
   // ── Network mode validations (before allocating resources) ─────────
@@ -1071,7 +1071,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
           'Network mode requires an identity database. Create at least one identity first with: hq-vault identity create',
         );
       }
-      preCheckIdentityDb = new IdentityDatabase(idDbPath);
+      preCheckIdentityDb = await IdentityDatabase.open(idDbPath);
       const identities = preCheckIdentityDb.listIdentities();
       if (identities.length === 0) {
         throw new Error(
@@ -1091,7 +1091,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
   writeTokenFile(tokenFile, token);
 
   // Open a database connection for the token manager (separate from VaultEngine's)
-  const tokenDb = new VaultDatabase(config.vaultPath);
+  const tokenDb = await VaultDatabase.open(config.vaultPath);
   const tokenManager = new TokenManager(tokenDb);
 
   // Initialize the audit logger
@@ -1103,7 +1103,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
   let identityDb: IdentityDatabase | null = null;
   if (config.identityDbPath) {
     try {
-      identityDb = new IdentityDatabase(config.identityDbPath);
+      identityDb = await IdentityDatabase.open(config.identityDbPath);
     } catch {
       // Identity DB could not be opened — scoping will be disabled
     }
@@ -1111,7 +1111,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
     const defaultIdDbPath = getDefaultIdentityDbPath();
     if (fs.existsSync(defaultIdDbPath)) {
       try {
-        identityDb = new IdentityDatabase(defaultIdDbPath);
+        identityDb = await IdentityDatabase.open(defaultIdDbPath);
       } catch {
         // Identity DB could not be opened — scoping will be disabled
       }
@@ -1135,7 +1135,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
   }
 
   const state: ServerState = {
-    vault: new VaultEngine(config.vaultPath),
+    vault: await VaultEngine.open(config.vaultPath),
     idleTimer: null,
     idleTimeoutMs: config.idleTimeoutMs,
     lastActivity: Date.now(),
@@ -1235,7 +1235,7 @@ function cleanup(config: ServerConfig, state: ServerState, srv: https.Server | h
     clearTimeout(state.idleTimer);
     state.idleTimer = null;
   }
-  try { state.vault.close(); } catch { /* ok */ }
+  try { state.vault.close().catch(() => {}); } catch { /* ok */ }
   try { state.tokenDb.close(); } catch { /* ok */ }
   try { state.auditLogger.close(); } catch { /* ok */ }
   try { if (state.identityDb) state.identityDb.close(); } catch { /* ok */ }

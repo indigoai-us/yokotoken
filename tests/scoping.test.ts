@@ -31,10 +31,10 @@ import os from 'node:os';
 let tmpDir: string;
 let identityDb: IdentityDatabase;
 
-function createTestDb(): IdentityDatabase {
+async function createTestDb(): Promise<IdentityDatabase> {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-scoping-'));
   const dbPath = path.join(tmpDir, 'identity.db');
-  return new IdentityDatabase(dbPath);
+  return await IdentityDatabase.open(dbPath);
 }
 
 function cleanupTestDb(): void {
@@ -46,8 +46,8 @@ function cleanupTestDb(): void {
   }
 }
 
-beforeEach(() => {
-  identityDb = createTestDb();
+beforeEach(async () => {
+  identityDb = await createTestDb();
 });
 
 afterEach(() => {
@@ -153,56 +153,56 @@ describe('buildScopedPath', () => {
 // ─── Access Control Matrix ───────────────────────────────────────
 
 describe('checkAccess — org-level secrets', () => {
-  it('should allow org admin to read org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    identityDb.createOrg('indigo', admin.id);
+  it('should allow org admin to read org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    await identityDb.createOrg('indigo', admin.id);
 
     const result = checkAccess(identityDb, admin.id, 'org/indigo/api-key', 'read');
     expect(result.allowed).toBe(true);
   });
 
-  it('should allow org admin to write org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    identityDb.createOrg('indigo', admin.id);
+  it('should allow org admin to write org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    await identityDb.createOrg('indigo', admin.id);
 
     const result = checkAccess(identityDb, admin.id, 'org/indigo/api-key', 'write');
     expect(result.allowed).toBe(true);
   });
 
-  it('should allow org member to read org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: member } = identityDb.createIdentity('member', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should allow org member to read org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: member } = await identityDb.createIdentity('member', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, member.id, 'member');
 
     const result = checkAccess(identityDb, member.id, 'org/indigo/api-key', 'read');
     expect(result.allowed).toBe(true);
   });
 
-  it('should allow org member to write org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: member } = identityDb.createIdentity('member', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should allow org member to write org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: member } = await identityDb.createIdentity('member', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, member.id, 'member');
 
     const result = checkAccess(identityDb, member.id, 'org/indigo/api-key', 'write');
     expect(result.allowed).toBe(true);
   });
 
-  it('should allow org readonly to read org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: reader } = identityDb.createIdentity('reader', 'agent');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should allow org readonly to read org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: reader } = await identityDb.createIdentity('reader', 'agent');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, reader.id, 'readonly');
 
     const result = checkAccess(identityDb, reader.id, 'org/indigo/api-key', 'read');
     expect(result.allowed).toBe(true);
   });
 
-  it('should deny org readonly from writing org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: reader } = identityDb.createIdentity('reader', 'agent');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should deny org readonly from writing org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: reader } = await identityDb.createIdentity('reader', 'agent');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, reader.id, 'readonly');
 
     const result = checkAccess(identityDb, reader.id, 'org/indigo/api-key', 'write');
@@ -210,20 +210,20 @@ describe('checkAccess — org-level secrets', () => {
     expect(result.reason).toContain('readonly');
   });
 
-  it('should deny non-member from reading org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: outsider } = identityDb.createIdentity('outsider', 'human');
-    identityDb.createOrg('indigo', admin.id);
+  it('should deny non-member from reading org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: outsider } = await identityDb.createIdentity('outsider', 'human');
+    await identityDb.createOrg('indigo', admin.id);
 
     const result = checkAccess(identityDb, outsider.id, 'org/indigo/api-key', 'read');
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain('not a member');
   });
 
-  it('should deny non-member from writing org secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: outsider } = identityDb.createIdentity('outsider', 'human');
-    identityDb.createOrg('indigo', admin.id);
+  it('should deny non-member from writing org secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: outsider } = await identityDb.createIdentity('outsider', 'human');
+    await identityDb.createOrg('indigo', admin.id);
 
     const result = checkAccess(identityDb, outsider.id, 'org/indigo/api-key', 'write');
     expect(result.allowed).toBe(false);
@@ -231,10 +231,10 @@ describe('checkAccess — org-level secrets', () => {
 });
 
 describe('checkAccess — project-level secrets', () => {
-  it('should allow org admin to read project secrets (even without project membership)', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
-    identityDb.createProject(org.id, 'hq-cloud', admin.id);
+  it('should allow org admin to read project secrets (even without project membership)', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
+    await identityDb.createProject(org.id, 'hq-cloud', admin.id);
 
     const result = checkAccess(
       identityDb, admin.id, 'org/indigo/project/hq-cloud/db/password', 'read'
@@ -243,10 +243,10 @@ describe('checkAccess — project-level secrets', () => {
     expect(result.reason).toContain('Org admin');
   });
 
-  it('should allow org admin to write project secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
-    identityDb.createProject(org.id, 'hq-cloud', admin.id);
+  it('should allow org admin to write project secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
+    await identityDb.createProject(org.id, 'hq-cloud', admin.id);
 
     const result = checkAccess(
       identityDb, admin.id, 'org/indigo/project/hq-cloud/db/password', 'write'
@@ -254,12 +254,12 @@ describe('checkAccess — project-level secrets', () => {
     expect(result.allowed).toBe(true);
   });
 
-  it('should allow project member to read project secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: dev } = identityDb.createIdentity('dev', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should allow project member to read project secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: dev } = await identityDb.createIdentity('dev', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, dev.id, 'member');
-    const project = identityDb.createProject(org.id, 'hq-cloud', admin.id);
+    const project = await identityDb.createProject(org.id, 'hq-cloud', admin.id);
     identityDb.addProjectMember(project.id, dev.id, 'member');
 
     const result = checkAccess(
@@ -268,12 +268,12 @@ describe('checkAccess — project-level secrets', () => {
     expect(result.allowed).toBe(true);
   });
 
-  it('should allow project member to write project secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: dev } = identityDb.createIdentity('dev', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should allow project member to write project secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: dev } = await identityDb.createIdentity('dev', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, dev.id, 'member');
-    const project = identityDb.createProject(org.id, 'hq-cloud', admin.id);
+    const project = await identityDb.createProject(org.id, 'hq-cloud', admin.id);
     identityDb.addProjectMember(project.id, dev.id, 'member');
 
     const result = checkAccess(
@@ -282,12 +282,12 @@ describe('checkAccess — project-level secrets', () => {
     expect(result.allowed).toBe(true);
   });
 
-  it('should allow project readonly to read project secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: viewer } = identityDb.createIdentity('viewer', 'agent');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should allow project readonly to read project secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: viewer } = await identityDb.createIdentity('viewer', 'agent');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, viewer.id, 'member');
-    const project = identityDb.createProject(org.id, 'hq-cloud', admin.id);
+    const project = await identityDb.createProject(org.id, 'hq-cloud', admin.id);
     identityDb.addProjectMember(project.id, viewer.id, 'readonly');
 
     const result = checkAccess(
@@ -296,12 +296,12 @@ describe('checkAccess — project-level secrets', () => {
     expect(result.allowed).toBe(true);
   });
 
-  it('should deny project readonly from writing project secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: viewer } = identityDb.createIdentity('viewer', 'agent');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should deny project readonly from writing project secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: viewer } = await identityDb.createIdentity('viewer', 'agent');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, viewer.id, 'member');
-    const project = identityDb.createProject(org.id, 'hq-cloud', admin.id);
+    const project = await identityDb.createProject(org.id, 'hq-cloud', admin.id);
     identityDb.addProjectMember(project.id, viewer.id, 'readonly');
 
     const result = checkAccess(
@@ -311,12 +311,12 @@ describe('checkAccess — project-level secrets', () => {
     expect(result.reason).toContain('readonly');
   });
 
-  it('should deny org member without project membership from accessing project secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: orgMember } = identityDb.createIdentity('org-member', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should deny org member without project membership from accessing project secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: orgMember } = await identityDb.createIdentity('org-member', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, orgMember.id, 'member');
-    identityDb.createProject(org.id, 'hq-cloud', admin.id);
+    await identityDb.createProject(org.id, 'hq-cloud', admin.id);
 
     const result = checkAccess(
       identityDb, orgMember.id, 'org/indigo/project/hq-cloud/db/password', 'read'
@@ -325,11 +325,11 @@ describe('checkAccess — project-level secrets', () => {
     expect(result.reason).toContain('not a member of project');
   });
 
-  it('should deny non-member from accessing project secrets', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: outsider } = identityDb.createIdentity('outsider', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
-    identityDb.createProject(org.id, 'hq-cloud', admin.id);
+  it('should deny non-member from accessing project secrets', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: outsider } = await identityDb.createIdentity('outsider', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
+    await identityDb.createProject(org.id, 'hq-cloud', admin.id);
 
     const result = checkAccess(
       identityDb, outsider.id, 'org/indigo/project/hq-cloud/db/password', 'read'
@@ -339,9 +339,9 @@ describe('checkAccess — project-level secrets', () => {
 });
 
 describe('checkAccess — unscoped secrets', () => {
-  it('should deny identity access to unscoped secrets', () => {
-    const { identity } = identityDb.createIdentity('alice', 'human');
-    identityDb.createOrg('indigo', identity.id);
+  it('should deny identity access to unscoped secrets', async () => {
+    const { identity } = await identityDb.createIdentity('alice', 'human');
+    await identityDb.createOrg('indigo', identity.id);
 
     const result = checkAccess(identityDb, identity.id, 'local/my-key', 'read');
     expect(result.allowed).toBe(false);
@@ -350,17 +350,17 @@ describe('checkAccess — unscoped secrets', () => {
 });
 
 describe('checkAccess — edge cases', () => {
-  it('should deny access when org does not exist', () => {
-    const { identity } = identityDb.createIdentity('alice', 'human');
+  it('should deny access when org does not exist', async () => {
+    const { identity } = await identityDb.createIdentity('alice', 'human');
 
     const result = checkAccess(identityDb, identity.id, 'org/nonexistent/api-key', 'read');
     expect(result.allowed).toBe(false);
     expect(result.reason).toContain("Org 'nonexistent' not found");
   });
 
-  it('should deny access when project does not exist', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    identityDb.createOrg('indigo', admin.id);
+  it('should deny access when project does not exist', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    await identityDb.createOrg('indigo', admin.id);
 
     const result = checkAccess(
       identityDb, admin.id, 'org/indigo/project/nonexistent/key', 'read'
@@ -369,22 +369,22 @@ describe('checkAccess — edge cases', () => {
     expect(result.reason).toContain("Project 'nonexistent' not found");
   });
 
-  it('should handle admin access across multiple projects', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const org = identityDb.createOrg('acme', admin.id);
-    identityDb.createProject(org.id, 'project-a');
-    identityDb.createProject(org.id, 'project-b');
+  it('should handle admin access across multiple projects', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const org = await identityDb.createOrg('acme', admin.id);
+    await identityDb.createProject(org.id, 'project-a');
+    await identityDb.createProject(org.id, 'project-b');
 
     // Admin can access both projects
     expect(checkAccess(identityDb, admin.id, 'org/acme/project/project-a/key', 'read').allowed).toBe(true);
     expect(checkAccess(identityDb, admin.id, 'org/acme/project/project-b/key', 'write').allowed).toBe(true);
   });
 
-  it('should isolate access across orgs', () => {
-    const { identity: alice } = identityDb.createIdentity('alice', 'human');
-    const { identity: bob } = identityDb.createIdentity('bob', 'human');
-    identityDb.createOrg('acme', alice.id);
-    identityDb.createOrg('globex', bob.id);
+  it('should isolate access across orgs', async () => {
+    const { identity: alice } = await identityDb.createIdentity('alice', 'human');
+    const { identity: bob } = await identityDb.createIdentity('bob', 'human');
+    await identityDb.createOrg('acme', alice.id);
+    await identityDb.createOrg('globex', bob.id);
 
     // Alice cannot access Globex secrets
     expect(checkAccess(identityDb, alice.id, 'org/globex/api-key', 'read').allowed).toBe(false);
@@ -399,14 +399,14 @@ describe('checkAccess — edge cases', () => {
 // ─── List Filtering ─────────────────────────────────────────────
 
 describe('filterAccessiblePaths', () => {
-  it('should filter paths based on identity access', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: dev } = identityDb.createIdentity('dev', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
+  it('should filter paths based on identity access', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: dev } = await identityDb.createIdentity('dev', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
     identityDb.addOrgMember(org.id, dev.id, 'member');
-    const projectA = identityDb.createProject(org.id, 'alpha', admin.id);
+    const projectA = await identityDb.createProject(org.id, 'alpha', admin.id);
     identityDb.addProjectMember(projectA.id, dev.id, 'member');
-    identityDb.createProject(org.id, 'beta', admin.id);
+    await identityDb.createProject(org.id, 'beta', admin.id);
     // dev is NOT a member of project beta
 
     const allPaths = [
@@ -424,11 +424,11 @@ describe('filterAccessiblePaths', () => {
     expect(accessible).toHaveLength(2);
   });
 
-  it('should return all scoped paths for org admin', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
-    identityDb.createProject(org.id, 'alpha');
-    identityDb.createProject(org.id, 'beta');
+  it('should return all scoped paths for org admin', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
+    await identityDb.createProject(org.id, 'alpha');
+    await identityDb.createProject(org.id, 'beta');
 
     const allPaths = [
       'org/indigo/shared-key',
@@ -440,11 +440,11 @@ describe('filterAccessiblePaths', () => {
     expect(accessible).toHaveLength(3);
   });
 
-  it('should return empty list for non-member', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    const { identity: outsider } = identityDb.createIdentity('outsider', 'human');
-    const org = identityDb.createOrg('indigo', admin.id);
-    identityDb.createProject(org.id, 'alpha');
+  it('should return empty list for non-member', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    const { identity: outsider } = await identityDb.createIdentity('outsider', 'human');
+    const org = await identityDb.createOrg('indigo', admin.id);
+    await identityDb.createProject(org.id, 'alpha');
 
     const allPaths = [
       'org/indigo/shared-key',
@@ -455,9 +455,9 @@ describe('filterAccessiblePaths', () => {
     expect(accessible).toHaveLength(0);
   });
 
-  it('should handle empty path list', () => {
-    const { identity: admin } = identityDb.createIdentity('admin', 'human');
-    identityDb.createOrg('indigo', admin.id);
+  it('should handle empty path list', async () => {
+    const { identity: admin } = await identityDb.createIdentity('admin', 'human');
+    await identityDb.createOrg('indigo', admin.id);
 
     const accessible = filterAccessiblePaths(identityDb, admin.id, []);
     expect(accessible).toHaveLength(0);
@@ -467,22 +467,22 @@ describe('filterAccessiblePaths', () => {
 // ─── Integration: Full Access Control Matrix ─────────────────────
 
 describe('Access control matrix — full scenario', () => {
-  it('should enforce the complete access control matrix across roles', () => {
+  it('should enforce the complete access control matrix across roles', async () => {
     // Setup: org with admin, member, readonly, and an outsider
-    const { identity: orgAdmin } = identityDb.createIdentity('org-admin', 'human');
-    const { identity: orgMember } = identityDb.createIdentity('org-member', 'human');
-    const { identity: orgReadonly } = identityDb.createIdentity('org-readonly', 'agent');
-    const { identity: projectMember } = identityDb.createIdentity('project-member', 'human');
-    const { identity: projectReadonly } = identityDb.createIdentity('project-readonly', 'agent');
-    const { identity: outsider } = identityDb.createIdentity('outsider', 'human');
+    const { identity: orgAdmin } = await identityDb.createIdentity('org-admin', 'human');
+    const { identity: orgMember } = await identityDb.createIdentity('org-member', 'human');
+    const { identity: orgReadonly } = await identityDb.createIdentity('org-readonly', 'agent');
+    const { identity: projectMember } = await identityDb.createIdentity('project-member', 'human');
+    const { identity: projectReadonly } = await identityDb.createIdentity('project-readonly', 'agent');
+    const { identity: outsider } = await identityDb.createIdentity('outsider', 'human');
 
-    const org = identityDb.createOrg('acme', orgAdmin.id);
+    const org = await identityDb.createOrg('acme', orgAdmin.id);
     identityDb.addOrgMember(org.id, orgMember.id, 'member');
     identityDb.addOrgMember(org.id, orgReadonly.id, 'readonly');
     identityDb.addOrgMember(org.id, projectMember.id, 'member');
     identityDb.addOrgMember(org.id, projectReadonly.id, 'member');
 
-    const project = identityDb.createProject(org.id, 'infra', orgAdmin.id);
+    const project = await identityDb.createProject(org.id, 'infra', orgAdmin.id);
     identityDb.addProjectMember(project.id, projectMember.id, 'member');
     identityDb.addProjectMember(project.id, projectReadonly.id, 'readonly');
 

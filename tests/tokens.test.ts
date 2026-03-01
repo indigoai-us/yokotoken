@@ -137,9 +137,9 @@ describe('Tokens — TokenManager (direct)', () => {
   let db: VaultDatabase;
   let manager: TokenManager;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-tm-'));
-    db = new VaultDatabase(path.join(tmpDir, 'vault.db'));
+    db = await VaultDatabase.open(path.join(tmpDir, 'vault.db'));
     manager = new TokenManager(db);
   });
 
@@ -220,9 +220,10 @@ describe('Tokens — TokenManager (direct)', () => {
     // Manually hack the expires_at to be in the past
     // (We can't really wait — so we'll do a direct DB update)
     const pastDate = new Date(Date.now() - 10_000).toISOString();
-    db['db'].prepare(
-      "UPDATE token_store SET expires_at = ? WHERE name = ?"
-    ).run(pastDate, 'expired-token');
+    db['db'].run(
+      "UPDATE token_store SET expires_at = ? WHERE name = ?",
+      [pastDate, 'expired-token'],
+    );
 
     const validation = manager.validate(result.token);
     expect(validation.valid).toBe(false);
@@ -300,10 +301,10 @@ describe('Tokens — server endpoints (POST/GET/DELETE /v1/tokens)', () => {
     tmpDir = result.tmpDir;
 
     // Pre-initialize vault
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('test/secret', 'secret-value');
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('test/secret', 'secret-value');
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     port = getPort(server);
@@ -424,10 +425,10 @@ describe('Tokens — managed token auth on vault endpoints', () => {
     tmpDir = result.tmpDir;
 
     // Pre-initialize vault
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('test/my-secret', 'the-value');
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('test/my-secret', 'the-value');
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     port = getPort(server);
@@ -508,9 +509,9 @@ describe('Tokens — expired and max-uses rejection at server level', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     port = getPort(server);

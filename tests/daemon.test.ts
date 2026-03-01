@@ -146,7 +146,7 @@ describe('Daemon — start/stop lifecycle', () => {
   let tokenFile: string;
   let logFile: string;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     // Verify compiled CLI exists
     if (!fs.existsSync(CLI_PATH)) {
       throw new Error(
@@ -162,9 +162,9 @@ describe('Daemon — start/stop lifecycle', () => {
     logFile = path.join(tmpDir, 'vault.log');
 
     // Pre-initialize a vault
-    const vault = new VaultEngine(vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
   });
 
   afterAll(async () => {
@@ -285,7 +285,7 @@ describe('Daemon — restart', () => {
   let tokenFile: string;
   let logFile: string;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-daemon-restart-'));
     vaultPath = path.join(tmpDir, 'vault.db');
     pidFile = path.join(tmpDir, 'vault.pid');
@@ -294,9 +294,9 @@ describe('Daemon — restart', () => {
     logFile = path.join(tmpDir, 'vault.log');
 
     // Pre-initialize a vault
-    const vault = new VaultEngine(vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
   });
 
   afterAll(async () => {

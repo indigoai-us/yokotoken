@@ -69,9 +69,9 @@ describe('VaultDatabase — rotation columns', () => {
   let db: VaultDatabase;
   let tmpDir: string;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-rot-db-'));
-    db = new VaultDatabase(path.join(tmpDir, 'vault.db'));
+    db = await VaultDatabase.open(path.join(tmpDir, 'vault.db'));
   });
 
   afterAll(() => {
@@ -162,26 +162,26 @@ describe('VaultEngine — rotation/expiry', () => {
   let vault: VaultEngine;
   let tmpDir: string;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hq-vault-rot-engine-'));
-    vault = new VaultEngine(path.join(tmpDir, 'vault.db'));
-    vault.init(PASSPHRASE);
+    vault = await VaultEngine.open(path.join(tmpDir, 'vault.db'));
+    await vault.init(PASSPHRASE);
   });
 
-  afterAll(() => {
-    try { vault.close(); } catch { /* ok */ }
+  afterAll(async () => {
+    try { await vault.close(); } catch { /* ok */ }
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
   });
 
-  it('should store a secret with expiry and retrieve expired flag', () => {
+  it('should store a secret with expiry and retrieve expired flag', async () => {
     // Store a secret that has already expired
-    vault.store('creds/expired-key', 'secret-value', {
+    await vault.store('creds/expired-key', 'secret-value', {
       type: 'api-key',
       description: 'An already expired key',
       expires_at: '2020-01-01T00:00:00.000Z',
     });
 
-    const entry = vault.get('creds/expired-key');
+    const entry = await vault.get('creds/expired-key');
     expect(entry).not.toBeNull();
     expect(entry!.value).toBe('secret-value');
     expect(entry!.expired).toBe(true);
@@ -189,52 +189,52 @@ describe('VaultEngine — rotation/expiry', () => {
     expect(entry!.metadata.expires_at).toBe('2020-01-01T00:00:00.000Z');
   });
 
-  it('should return expired=false for non-expired secret', () => {
-    vault.store('creds/fresh-key', 'value', {
+  it('should return expired=false for non-expired secret', async () => {
+    await vault.store('creds/fresh-key', 'value', {
       expires_at: '2099-12-31T00:00:00.000Z',
     });
 
-    const entry = vault.get('creds/fresh-key');
+    const entry = await vault.get('creds/fresh-key');
     expect(entry!.expired).toBe(false);
   });
 
-  it('should return expired=false when no expiry is set', () => {
-    vault.store('creds/no-expiry', 'value');
-    const entry = vault.get('creds/no-expiry');
+  it('should return expired=false when no expiry is set', async () => {
+    await vault.store('creds/no-expiry', 'value');
+    const entry = await vault.get('creds/no-expiry');
     expect(entry!.expired).toBe(false);
     expect(entry!.stale).toBe(false);
   });
 
-  it('should detect stale secrets (past rotation interval)', () => {
+  it('should detect stale secrets (past rotation interval)', async () => {
     // Store a secret with a very short rotation interval and old last_rotated_at
-    vault.store('creds/stale-key', 'old-secret', {
+    await vault.store('creds/stale-key', 'old-secret', {
       rotation_interval: '1d',
       last_rotated_at: '2020-01-01T00:00:00.000Z',
     });
 
-    const entry = vault.get('creds/stale-key');
+    const entry = await vault.get('creds/stale-key');
     expect(entry!.stale).toBe(true);
   });
 
-  it('should return stale=false when rotation interval is not exceeded', () => {
+  it('should return stale=false when rotation interval is not exceeded', async () => {
     // Use a long rotation interval with recent last_rotated_at
-    vault.store('creds/recently-rotated', 'value', {
+    await vault.store('creds/recently-rotated', 'value', {
       rotation_interval: '365d',
       last_rotated_at: new Date().toISOString(),
     });
 
-    const entry = vault.get('creds/recently-rotated');
+    const entry = await vault.get('creds/recently-rotated');
     expect(entry!.stale).toBe(false);
   });
 
-  it('should use created_at when last_rotated_at is not set for stale check', () => {
+  it('should use created_at when last_rotated_at is not set for stale check', async () => {
     // This secret has a rotation_interval but no last_rotated_at
     // Since it was just created, it should NOT be stale with 365d interval
-    vault.store('creds/new-with-interval', 'value', {
+    await vault.store('creds/new-with-interval', 'value', {
       rotation_interval: '365d',
     });
 
-    const entry = vault.get('creds/new-with-interval');
+    const entry = await vault.get('creds/new-with-interval');
     expect(entry!.stale).toBe(false);
   });
 

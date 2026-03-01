@@ -1,15 +1,19 @@
 /**
  * SQLite database layer for hq-vault.
  *
- * Uses better-sqlite3 for synchronous, single-file database access.
+ * Uses sql.js (SQLite compiled to WASM) for portable, single-file database access.
  * The vault file is a single portable SQLite database.
+ *
+ * Because sql.js databases live in memory, this module handles file persistence:
+ * - Read the .db file into a Buffer on open (if it exists)
+ * - Call db.export() and write to disk after mutations
  *
  * Schema:
  * - vault_meta: stores vault configuration (salt, version, etc.)
  * - secrets: stores encrypted secret entries
  */
 
-import Database from 'better-sqlite3';
+import initSqlJs, { type Database as SqlJsDatabase } from 'sql.js';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -45,31 +49,77 @@ export interface VaultMetaRow {
   value: Buffer | string;
 }
 
-export class VaultDatabase {
-  private db: Database.Database;
+/** Cached sql.js SQL module (loaded once). */
+let sqlJsModule: Awaited<ReturnType<typeof initSqlJs>> | null = null;
 
-  constructor(dbPath: string) {
-    // Ensure the directory exists
+async function getSqlJs() {
+  if (!sqlJsModule) {
+    sqlJsModule = await initSqlJs();
+  }
+  return sqlJsModule;
+}
+
+export class VaultDatabase {
+  private db: SqlJsDatabase;
+  private dbPath: string;
+
+  /** Use VaultDatabase.open(dbPath) instead of constructor. */
+  private constructor(db: SqlJsDatabase, dbPath: string) {
+    this.db = db;
+    this.dbPath = dbPath;
+  }
+
+  /**
+   * Open or create a vault database at the given path.
+   * This is the async factory method that replaces the constructor.
+   */
+  static async open(dbPath: string): Promise<VaultDatabase> {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    this.db = new Database(dbPath);
+    const SQL = await getSqlJs();
 
-    // Enable WAL mode for better concurrency
-    this.db.pragma('journal_mode = WAL');
+    let db: SqlJsDatabase;
+    if (fs.existsSync(dbPath)) {
+      const fileBuffer = fs.readFileSync(dbPath);
+      db = new SQL.Database(fileBuffer);
+    } else {
+      db = new SQL.Database();
+    }
+
     // Enforce foreign keys
-    this.db.pragma('foreign_keys = ON');
+    db.run('PRAGMA foreign_keys = ON');
 
-    this.initSchema();
+    const instance = new VaultDatabase(db, dbPath);
+    instance.initSchema();
+
+    // Re-enable foreign keys after schema init — sql.js multi-statement
+    // db.run() can reset connection-level PRAGMAs.
+    db.run('PRAGMA foreign_keys = ON');
+
+    return instance;
+  }
+
+  /**
+   * Persist the in-memory database to disk.
+   *
+   * Note: sql.js `db.export()` resets connection-level PRAGMAs (including
+   * foreign_keys) as a side-effect, so we re-enable foreign keys after export.
+   */
+  private save(): void {
+    const data = this.db.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(this.dbPath, buffer);
+    this.db.run('PRAGMA foreign_keys = ON');
   }
 
   /**
    * Initialize database schema if tables don't exist.
    */
   private initSchema(): void {
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS vault_meta (
         key   TEXT PRIMARY KEY,
         value BLOB NOT NULL
@@ -106,6 +156,7 @@ export class VaultDatabase {
 
     // ── Migration: add rotation/expiry columns (US-009) ───────────────
     this.migrateRotationColumns();
+    this.save();
   }
 
   /**
@@ -114,17 +165,22 @@ export class VaultDatabase {
    */
   private migrateRotationColumns(): void {
     // Check if columns already exist by inspecting table_info
-    const columns = this.db.pragma('table_info(secrets)') as Array<{ name: string }>;
-    const colNames = new Set(columns.map(c => c.name));
+    const stmt = this.db.prepare('PRAGMA table_info(secrets)');
+    const colNames = new Set<string>();
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      colNames.add(row.name as string);
+    }
+    stmt.free();
 
     if (!colNames.has('expires_at')) {
-      this.db.exec('ALTER TABLE secrets ADD COLUMN expires_at TEXT');
+      this.db.run('ALTER TABLE secrets ADD COLUMN expires_at TEXT');
     }
     if (!colNames.has('rotation_interval')) {
-      this.db.exec('ALTER TABLE secrets ADD COLUMN rotation_interval TEXT');
+      this.db.run('ALTER TABLE secrets ADD COLUMN rotation_interval TEXT');
     }
     if (!colNames.has('last_rotated_at')) {
-      this.db.exec('ALTER TABLE secrets ADD COLUMN last_rotated_at TEXT');
+      this.db.run('ALTER TABLE secrets ADD COLUMN last_rotated_at TEXT');
     }
   }
 
@@ -133,20 +189,27 @@ export class VaultDatabase {
    */
   setMeta(key: string, value: Buffer | string): void {
     const valueBuf = typeof value === 'string' ? Buffer.from(value, 'utf-8') : value;
-    this.db.prepare(`
-      INSERT INTO vault_meta (key, value) VALUES (?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(key, valueBuf);
+    this.db.run(
+      `INSERT INTO vault_meta (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      [key, valueBuf as unknown as Uint8Array],
+    );
+    this.save();
   }
 
   /**
    * Retrieve a vault metadata value.
    */
   getMeta(key: string): Buffer | null {
-    const row = this.db.prepare(
-      'SELECT value FROM vault_meta WHERE key = ?'
-    ).get(key) as { value: Buffer } | undefined;
-    return row ? row.value : null;
+    const stmt = this.db.prepare('SELECT value FROM vault_meta WHERE key = ?');
+    stmt.bind([key]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return Buffer.from(row.value as Uint8Array);
+    }
+    stmt.free();
+    return null;
   }
 
   /**
@@ -164,15 +227,10 @@ export class VaultDatabase {
       last_rotated_at?: string | null;
     },
   ): void {
-    this.db.prepare(`
-      INSERT INTO vault_meta (key, value) VALUES ('_noop', X'00')
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(); // no-op to ensure transaction works
-
     const existing = this.getSecretRow(secretPath);
     if (existing) {
-      this.db.prepare(`
-        UPDATE secrets
+      this.db.run(
+        `UPDATE secrets
         SET encrypted_value = ?,
             nonce = ?,
             secret_type = COALESCE(?, secret_type),
@@ -181,89 +239,103 @@ export class VaultDatabase {
             rotation_interval = COALESCE(?, rotation_interval),
             last_rotated_at = COALESCE(?, last_rotated_at),
             updated_at = datetime('now')
-        WHERE path = ?
-      `).run(
-        encryptedValue,
-        nonce,
-        secretType ?? null,
-        description ?? null,
-        rotation?.expires_at ?? null,
-        rotation?.rotation_interval ?? null,
-        rotation?.last_rotated_at ?? null,
-        secretPath,
+        WHERE path = ?`,
+        [
+          encryptedValue as unknown as Uint8Array,
+          nonce as unknown as Uint8Array,
+          secretType ?? null,
+          description ?? null,
+          rotation?.expires_at ?? null,
+          rotation?.rotation_interval ?? null,
+          rotation?.last_rotated_at ?? null,
+          secretPath,
+        ],
       );
     } else {
-      this.db.prepare(`
-        INSERT INTO secrets (path, encrypted_value, nonce, secret_type, description, expires_at, rotation_interval, last_rotated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        secretPath,
-        encryptedValue,
-        nonce,
-        secretType ?? null,
-        description ?? null,
-        rotation?.expires_at ?? null,
-        rotation?.rotation_interval ?? null,
-        rotation?.last_rotated_at ?? null,
+      this.db.run(
+        `INSERT INTO secrets (path, encrypted_value, nonce, secret_type, description, expires_at, rotation_interval, last_rotated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          secretPath,
+          encryptedValue as unknown as Uint8Array,
+          nonce as unknown as Uint8Array,
+          secretType ?? null,
+          description ?? null,
+          rotation?.expires_at ?? null,
+          rotation?.rotation_interval ?? null,
+          rotation?.last_rotated_at ?? null,
+        ],
       );
     }
-
-    // Clean up no-op meta entry
-    this.db.prepare("DELETE FROM vault_meta WHERE key = '_noop'").run();
+    this.save();
   }
 
   /**
    * Retrieve an encrypted secret row by path.
    */
   getSecretRow(secretPath: string): SecretRow | null {
-    const row = this.db.prepare(
-      'SELECT * FROM secrets WHERE path = ?'
-    ).get(secretPath) as SecretRow | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM secrets WHERE path = ?');
+    stmt.bind([secretPath]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return this.toSecretRow(row);
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * List all secret paths, optionally filtered by prefix.
    */
   listSecrets(prefix?: string): SecretRow[] {
+    const results: SecretRow[] = [];
+    let stmt;
     if (prefix) {
-      return this.db.prepare(
-        'SELECT * FROM secrets WHERE path LIKE ? ORDER BY path'
-      ).all(`${prefix}%`) as SecretRow[];
+      stmt = this.db.prepare('SELECT * FROM secrets WHERE path LIKE ? ORDER BY path');
+      stmt.bind([`${prefix}%`]);
+    } else {
+      stmt = this.db.prepare('SELECT * FROM secrets ORDER BY path');
     }
-    return this.db.prepare(
-      'SELECT * FROM secrets ORDER BY path'
-    ).all() as SecretRow[];
+    while (stmt.step()) {
+      results.push(this.toSecretRow(stmt.getAsObject()));
+    }
+    stmt.free();
+    return results;
   }
 
   /**
    * Delete a secret by path. Returns true if a row was deleted.
    */
   deleteSecret(secretPath: string): boolean {
-    const result = this.db.prepare(
-      'DELETE FROM secrets WHERE path = ?'
-    ).run(secretPath);
-    return result.changes > 0;
+    const countBefore = this.countSecrets();
+    this.db.run('DELETE FROM secrets WHERE path = ?', [secretPath]);
+    const countAfter = this.countSecrets();
+    const deleted = countAfter < countBefore;
+    if (deleted) this.save();
+    return deleted;
   }
 
   /**
    * Count total secrets in the vault.
    */
   countSecrets(): number {
-    const row = this.db.prepare(
-      'SELECT COUNT(*) as count FROM secrets'
-    ).get() as { count: number };
-    return row.count;
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM secrets');
+    stmt.step();
+    const row = stmt.getAsObject();
+    stmt.free();
+    return row.count as number;
   }
 
   /**
    * Check if a secret exists at the given path.
    */
   hasSecret(secretPath: string): boolean {
-    const row = this.db.prepare(
-      'SELECT 1 FROM secrets WHERE path = ? LIMIT 1'
-    ).get(secretPath);
-    return row !== undefined;
+    const stmt = this.db.prepare('SELECT 1 FROM secrets WHERE path = ? LIMIT 1');
+    stmt.bind([secretPath]);
+    const exists = stmt.step();
+    stmt.free();
+    return exists;
   }
 
   // ─── Token store methods ──────────────────────────────────────────
@@ -278,11 +350,12 @@ export class VaultDatabase {
     maxUses?: number | null,
     identityId?: string | null,
   ): TokenRow {
-    this.db.prepare(`
-      INSERT INTO token_store (name, token_hash, expires_at, max_uses, identity_id)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(name, tokenHash, expiresAt ?? null, maxUses ?? null, identityId ?? null);
-
+    this.db.run(
+      `INSERT INTO token_store (name, token_hash, expires_at, max_uses, identity_id)
+      VALUES (?, ?, ?, ?, ?)`,
+      [name, tokenHash, expiresAt ?? null, maxUses ?? null, identityId ?? null],
+    );
+    this.save();
     return this.getTokenByName(name)!;
   }
 
@@ -290,61 +363,80 @@ export class VaultDatabase {
    * Find a token by its SHA-256 hash.
    */
   getTokenByHash(tokenHash: string): TokenRow | null {
-    const row = this.db.prepare(
-      'SELECT * FROM token_store WHERE token_hash = ?'
-    ).get(tokenHash) as TokenRow | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM token_store WHERE token_hash = ?');
+    stmt.bind([tokenHash]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return this.toTokenRow(row);
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * Find a token by name.
    */
   getTokenByName(name: string): TokenRow | null {
-    const row = this.db.prepare(
-      'SELECT * FROM token_store WHERE name = ?'
-    ).get(name) as TokenRow | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM token_store WHERE name = ?');
+    stmt.bind([name]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return this.toTokenRow(row);
+    }
+    stmt.free();
+    return null;
   }
 
   /**
    * List all tokens (metadata only).
    */
   listTokens(): TokenRow[] {
-    return this.db.prepare(
-      'SELECT * FROM token_store ORDER BY created_at DESC'
-    ).all() as TokenRow[];
+    const results: TokenRow[] = [];
+    const stmt = this.db.prepare('SELECT * FROM token_store ORDER BY created_at DESC');
+    while (stmt.step()) {
+      results.push(this.toTokenRow(stmt.getAsObject()));
+    }
+    stmt.free();
+    return results;
   }
 
   /**
    * Update the last_used_at timestamp and increment use_count for a token.
    */
   recordTokenUsage(tokenHash: string): void {
-    this.db.prepare(`
-      UPDATE token_store
+    this.db.run(
+      `UPDATE token_store
       SET last_used_at = datetime('now'),
           use_count = use_count + 1
-      WHERE token_hash = ?
-    `).run(tokenHash);
+      WHERE token_hash = ?`,
+      [tokenHash],
+    );
+    this.save();
   }
 
   /**
    * Delete a token by name. Returns true if a row was deleted.
    */
   deleteToken(name: string): boolean {
-    const result = this.db.prepare(
-      'DELETE FROM token_store WHERE name = ?'
-    ).run(name);
-    return result.changes > 0;
+    const before = this.countTokens();
+    this.db.run('DELETE FROM token_store WHERE name = ?', [name]);
+    const after = this.countTokens();
+    const deleted = after < before;
+    if (deleted) this.save();
+    return deleted;
   }
 
   /**
    * Count total tokens in the store.
    */
   countTokens(): number {
-    const row = this.db.prepare(
-      'SELECT COUNT(*) as count FROM token_store'
-    ).get() as { count: number };
-    return row.count;
+    const stmt = this.db.prepare('SELECT COUNT(*) as count FROM token_store');
+    stmt.step();
+    const row = stmt.getAsObject();
+    stmt.free();
+    return row.count as number;
   }
 
   // ─── Rotation / Expiry queries (US-009) ─────────────────────────
@@ -354,30 +446,38 @@ export class VaultDatabase {
    * Only returns rows where expires_at is non-null.
    */
   listExpiringSecrets(beforeIso: string): SecretRow[] {
-    return this.db.prepare(
+    const results: SecretRow[] = [];
+    const stmt = this.db.prepare(
       `SELECT * FROM secrets
        WHERE expires_at IS NOT NULL
          AND expires_at <= ?
          AND path != '__vault_verify__'
-       ORDER BY expires_at ASC`
-    ).all(beforeIso) as SecretRow[];
+       ORDER BY expires_at ASC`,
+    );
+    stmt.bind([beforeIso]);
+    while (stmt.step()) {
+      results.push(this.toSecretRow(stmt.getAsObject()));
+    }
+    stmt.free();
+    return results;
   }
 
   /**
    * List secrets that are past their rotation interval.
-   * A secret is "stale" when:
-   *   (last_rotated_at OR created_at) + rotation_interval < now
-   *
-   * Since SQLite cannot natively add arbitrary durations, we return all
-   * secrets with a rotation_interval and let the caller do the math.
    */
   listSecretsWithRotationInterval(): SecretRow[] {
-    return this.db.prepare(
+    const results: SecretRow[] = [];
+    const stmt = this.db.prepare(
       `SELECT * FROM secrets
        WHERE rotation_interval IS NOT NULL
          AND path != '__vault_verify__'
-       ORDER BY path ASC`
-    ).all() as SecretRow[];
+       ORDER BY path ASC`,
+    );
+    while (stmt.step()) {
+      results.push(this.toSecretRow(stmt.getAsObject()));
+    }
+    stmt.free();
+    return results;
   }
 
   /**
@@ -412,15 +512,70 @@ export class VaultDatabase {
     sets.push("updated_at = datetime('now')");
     params.push(secretPath);
 
-    this.db.prepare(
-      `UPDATE secrets SET ${sets.join(', ')} WHERE path = ?`
-    ).run(...params);
+    this.db.run(
+      `UPDATE secrets SET ${sets.join(', ')} WHERE path = ?`,
+      params,
+    );
+    this.save();
+  }
+
+  /**
+   * Get the underlying sql.js database. Used by AccessRequestManager
+   * that needs direct access to the same connection.
+   */
+  getRawDb(): SqlJsDatabase {
+    return this.db;
+  }
+
+  /**
+   * Save pending changes to disk. Exposed for modules that use getRawDb()
+   * to write directly and then need to persist.
+   */
+  persist(): void {
+    this.save();
   }
 
   /**
    * Close the database connection.
    */
   close(): void {
+    try {
+      this.save();
+    } catch {
+      // best effort save on close
+    }
     this.db.close();
+  }
+
+  // ─── Row mapping helpers ──────────────────────────────────────────
+
+  private toSecretRow(row: Record<string, unknown>): SecretRow {
+    return {
+      id: row.id as number,
+      path: row.path as string,
+      encrypted_value: Buffer.from(row.encrypted_value as Uint8Array),
+      nonce: Buffer.from(row.nonce as Uint8Array),
+      secret_type: (row.secret_type as string) ?? null,
+      description: (row.description as string) ?? null,
+      created_at: row.created_at as string,
+      updated_at: row.updated_at as string,
+      expires_at: (row.expires_at as string) ?? null,
+      rotation_interval: (row.rotation_interval as string) ?? null,
+      last_rotated_at: (row.last_rotated_at as string) ?? null,
+    };
+  }
+
+  private toTokenRow(row: Record<string, unknown>): TokenRow {
+    return {
+      id: row.id as number,
+      name: row.name as string,
+      token_hash: row.token_hash as string,
+      created_at: row.created_at as string,
+      expires_at: (row.expires_at as string) ?? null,
+      last_used_at: (row.last_used_at as string) ?? null,
+      use_count: row.use_count as number,
+      max_uses: (row.max_uses as number) ?? null,
+      identity_id: (row.identity_id as string) ?? null,
+    };
   }
 }

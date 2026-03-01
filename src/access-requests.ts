@@ -7,11 +7,12 @@
  * - Approved requests automatically create org/project membership
  * - Requests expire after 24 hours if not reviewed
  *
- * Uses the identity database (SQLite) for storage and references
+ * Uses the identity database (sql.js) for storage and references
  * the existing identity/org/project tables via foreign keys.
  */
 
 import crypto from 'node:crypto';
+import type { Database as SqlJsDatabase } from 'sql.js';
 import type { IdentityDatabase, MemberRole } from './identity.js';
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -57,36 +58,22 @@ export const REQUEST_EXPIRY_HOURS = 24;
 
 /**
  * Manages access requests within the identity database.
- *
- * Creates an `access_requests` table in the identity database
- * and provides CRUD + approval/denial operations.
  */
 export class AccessRequestManager {
   private identityDb: IdentityDatabase;
-  private db: ReturnType<typeof this.getDb>;
+  private db: SqlJsDatabase;
 
   constructor(identityDb: IdentityDatabase) {
     this.identityDb = identityDb;
-    this.db = this.getDb();
+    this.db = identityDb.getRawDb();
     this.initSchema();
-  }
-
-  /**
-   * Access the underlying better-sqlite3 database from the IdentityDatabase.
-   * We use the same database connection to ensure foreign key consistency.
-   */
-  private getDb() {
-    // Access the private db property — we need to use the same SQLite connection
-    // as the IdentityDatabase for foreign key enforcement.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.identityDb as any).db;
   }
 
   /**
    * Initialize the access_requests table schema.
    */
   private initSchema(): void {
-    this.db.exec(`
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS access_requests (
         request_id     TEXT PRIMARY KEY,
         identity_id    TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
@@ -105,22 +92,15 @@ export class AccessRequestManager {
       CREATE INDEX IF NOT EXISTS idx_access_requests_org ON access_requests(org);
       CREATE INDEX IF NOT EXISTS idx_access_requests_status ON access_requests(status);
     `);
+
+    // Re-enable foreign keys — sql.js multi-statement db.run() can reset PRAGMAs
+    this.db.run('PRAGMA foreign_keys = ON');
+
+    this.identityDb.persist();
   }
 
   // ─── Create ───────────────────────────────────────────────────────
 
-  /**
-   * Create a new access request.
-   *
-   * Validates:
-   * - Identity must exist
-   * - Org must exist (by name)
-   * - If project is specified, it must exist within the org
-   * - Role must be valid
-   * - No duplicate pending request for the same identity/org/project
-   *
-   * @returns The created access request with request_id and status 'pending'.
-   */
   createRequest(input: AccessRequestCreateInput): AccessRequest {
     const { identity_id, org, project, role_requested, justification } = input;
 
@@ -159,8 +139,11 @@ export class AccessRequestManager {
       SELECT request_id FROM access_requests
       WHERE identity_id = ? AND org = ? AND (project = ? OR (project IS NULL AND ? IS NULL)) AND status = 'pending'
     `);
-    const existing = existingStmt.get(identity_id, org, project ?? null, project ?? null);
-    if (existing) {
+    existingStmt.bind([identity_id, org, project ?? null, project ?? null]);
+    const hasDuplicate = existingStmt.step();
+    existingStmt.free();
+
+    if (hasDuplicate) {
       throw new Error('A pending access request already exists for this identity, org, and project');
     }
 
@@ -168,32 +151,30 @@ export class AccessRequestManager {
     const request_id = crypto.randomBytes(16).toString('hex');
 
     // Insert the request
-    this.db.prepare(`
-      INSERT INTO access_requests (request_id, identity_id, org, project, role_requested, justification)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(request_id, identity_id, org, project ?? null, role_requested, justification.trim());
+    this.db.run(
+      `INSERT INTO access_requests (request_id, identity_id, org, project, role_requested, justification)
+      VALUES (?, ?, ?, ?, ?, ?)`,
+      [request_id, identity_id, org, project ?? null, role_requested, justification.trim()],
+    );
+    this.identityDb.persist();
 
     return this.getRequest(request_id)!;
   }
 
   // ─── Read ─────────────────────────────────────────────────────────
 
-  /**
-   * Get an access request by ID.
-   */
   getRequest(requestId: string): AccessRequest | null {
-    const row = this.db.prepare(
-      'SELECT * FROM access_requests WHERE request_id = ?'
-    ).get(requestId) as AccessRequest | undefined;
-    return row ?? null;
+    const stmt = this.db.prepare('SELECT * FROM access_requests WHERE request_id = ?');
+    stmt.bind([requestId]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject();
+      stmt.free();
+      return this.toAccessRequest(row);
+    }
+    stmt.free();
+    return null;
   }
 
-  /**
-   * List access requests with optional filters.
-   *
-   * @param filters - Optional filters: org (name), status.
-   * @returns Array of matching access requests, ordered by created_at DESC.
-   */
   listRequests(filters?: AccessRequestListFilters): AccessRequest[] {
     let sql = 'SELECT * FROM access_requests WHERE 1=1';
     const params: unknown[] = [];
@@ -213,22 +194,20 @@ export class AccessRequestManager {
 
     sql += ' ORDER BY created_at DESC';
 
-    return this.db.prepare(sql).all(...params) as AccessRequest[];
+    const results: AccessRequest[] = [];
+    const stmt = this.db.prepare(sql);
+    if (params.length > 0) {
+      stmt.bind(params as (string | number | null)[]);
+    }
+    while (stmt.step()) {
+      results.push(this.toAccessRequest(stmt.getAsObject()));
+    }
+    stmt.free();
+    return results;
   }
 
   // ─── Approve ──────────────────────────────────────────────────────
 
-  /**
-   * Approve an access request.
-   *
-   * - Updates the request status to 'approved'
-   * - Creates the org membership (and project membership if specified)
-   * - Uses the requested role
-   *
-   * @param requestId - The request ID to approve.
-   * @param reviewedBy - The identity/name of the reviewer.
-   * @returns The updated access request.
-   */
   approveRequest(requestId: string, reviewedBy: string): AccessRequest {
     const request = this.getRequest(requestId);
     if (!request) {
@@ -241,12 +220,13 @@ export class AccessRequestManager {
 
     // Check if request has expired
     if (this.isExpired(request)) {
-      // Mark as denied due to expiry
-      this.db.prepare(`
-        UPDATE access_requests
+      this.db.run(
+        `UPDATE access_requests
         SET status = 'denied', denial_reason = 'Expired (not reviewed within 24 hours)', reviewed_at = datetime('now')
-        WHERE request_id = ?
-      `).run(requestId);
+        WHERE request_id = ?`,
+        [requestId],
+      );
+      this.identityDb.persist();
       throw new Error(`Access request '${requestId}' has expired`);
     }
 
@@ -256,50 +236,37 @@ export class AccessRequestManager {
       throw new Error(`Org '${request.org}' no longer exists`);
     }
 
-    // Create memberships in a transaction
-    const updateStatus = this.db.prepare(`
-      UPDATE access_requests
-      SET status = 'approved', reviewed_by = ?, reviewed_at = datetime('now')
-      WHERE request_id = ?
-    `);
+    // Add org membership (skip if already a member)
+    const existingOrgMember = this.identityDb.getOrgMember(orgRecord.id, request.identity_id);
+    if (!existingOrgMember) {
+      this.identityDb.addOrgMember(orgRecord.id, request.identity_id, request.role_requested);
+    }
 
-    const transaction = this.db.transaction(() => {
-      // Add org membership (skip if already a member)
-      const existingOrgMember = this.identityDb.getOrgMember(orgRecord.id, request.identity_id);
-      if (!existingOrgMember) {
-        this.identityDb.addOrgMember(orgRecord.id, request.identity_id, request.role_requested);
-      }
-
-      // Add project membership if requested
-      if (request.project) {
-        const projectRecord = this.identityDb.getProjectByName(orgRecord.id, request.project);
-        if (projectRecord) {
-          const existingProjectMember = this.identityDb.getProjectMember(projectRecord.id, request.identity_id);
-          if (!existingProjectMember) {
-            this.identityDb.addProjectMember(projectRecord.id, request.identity_id, request.role_requested);
-          }
+    // Add project membership if requested
+    if (request.project) {
+      const projectRecord = this.identityDb.getProjectByName(orgRecord.id, request.project);
+      if (projectRecord) {
+        const existingProjectMember = this.identityDb.getProjectMember(projectRecord.id, request.identity_id);
+        if (!existingProjectMember) {
+          this.identityDb.addProjectMember(projectRecord.id, request.identity_id, request.role_requested);
         }
       }
+    }
 
-      // Update the request status
-      updateStatus.run(reviewedBy, requestId);
-    });
-
-    transaction();
+    // Update the request status
+    this.db.run(
+      `UPDATE access_requests
+      SET status = 'approved', reviewed_by = ?, reviewed_at = datetime('now')
+      WHERE request_id = ?`,
+      [reviewedBy, requestId],
+    );
+    this.identityDb.persist();
 
     return this.getRequest(requestId)!;
   }
 
   // ─── Deny ─────────────────────────────────────────────────────────
 
-  /**
-   * Deny an access request.
-   *
-   * @param requestId - The request ID to deny.
-   * @param reviewedBy - The identity/name of the reviewer.
-   * @param reason - Optional denial reason.
-   * @returns The updated access request.
-   */
   denyRequest(requestId: string, reviewedBy: string, reason?: string): AccessRequest {
     const request = this.getRequest(requestId);
     if (!request) {
@@ -310,20 +277,19 @@ export class AccessRequestManager {
       throw new Error(`Access request '${requestId}' is already ${request.status}`);
     }
 
-    this.db.prepare(`
-      UPDATE access_requests
+    this.db.run(
+      `UPDATE access_requests
       SET status = 'denied', reviewed_by = ?, reviewed_at = datetime('now'), denial_reason = ?
-      WHERE request_id = ?
-    `).run(reviewedBy, reason?.trim() || null, requestId);
+      WHERE request_id = ?`,
+      [reviewedBy, reason?.trim() || null, requestId],
+    );
+    this.identityDb.persist();
 
     return this.getRequest(requestId)!;
   }
 
   // ─── Expiry ───────────────────────────────────────────────────────
 
-  /**
-   * Check if an access request has expired (older than 24 hours).
-   */
   isExpired(request: AccessRequest): boolean {
     const createdAt = new Date(request.created_at + 'Z').getTime();
     const now = Date.now();
@@ -331,18 +297,43 @@ export class AccessRequestManager {
     return now - createdAt > expiryMs;
   }
 
-  /**
-   * Clean up expired pending requests by marking them as denied.
-   *
-   * @returns The number of requests expired.
-   */
   cleanExpired(): number {
-    const result = this.db.prepare(`
-      UPDATE access_requests
-      SET status = 'denied', denial_reason = 'Expired (not reviewed within 24 hours)', reviewed_at = datetime('now')
-      WHERE status = 'pending' AND datetime(created_at, '+${REQUEST_EXPIRY_HOURS} hours') < datetime('now')
-    `).run();
+    // Count matching rows first
+    const countStmt = this.db.prepare(
+      `SELECT COUNT(*) as c FROM access_requests
+       WHERE status = 'pending' AND datetime(created_at, '+${REQUEST_EXPIRY_HOURS} hours') < datetime('now')`,
+    );
+    countStmt.step();
+    const count = (countStmt.getAsObject().c as number) || 0;
+    countStmt.free();
 
-    return result.changes;
+    if (count > 0) {
+      this.db.run(
+        `UPDATE access_requests
+        SET status = 'denied', denial_reason = 'Expired (not reviewed within 24 hours)', reviewed_at = datetime('now')
+        WHERE status = 'pending' AND datetime(created_at, '+${REQUEST_EXPIRY_HOURS} hours') < datetime('now')`,
+      );
+      this.identityDb.persist();
+    }
+
+    return count;
+  }
+
+  // ─── Row mapping ────────────────────────────────────────────────
+
+  private toAccessRequest(row: Record<string, unknown>): AccessRequest {
+    return {
+      request_id: row.request_id as string,
+      identity_id: row.identity_id as string,
+      org: row.org as string,
+      project: (row.project as string) ?? null,
+      role_requested: row.role_requested as MemberRole,
+      justification: row.justification as string,
+      status: row.status as AccessRequestStatus,
+      reviewed_by: (row.reviewed_by as string) ?? null,
+      reviewed_at: (row.reviewed_at as string) ?? null,
+      denial_reason: (row.denial_reason as string) ?? null,
+      created_at: row.created_at as string,
+    };
   }
 }
