@@ -41,6 +41,15 @@ import {
   envNameToPath,
   detectImportDuplicates,
 } from './backup.js';
+import {
+  readConfig,
+  writeConfig,
+  setConfigField,
+  resolveFieldName,
+  formatConfigForDisplay,
+  getDefaultConfigPath,
+  getValidFields,
+} from './config.js';
 import fs from 'node:fs';
 
 const program = new Command();
@@ -1913,6 +1922,105 @@ projectCmd
       }
     } catch (err) {
       process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── config ─────────────────────────────────────────────────────────
+const configCmd = program
+  .command('config')
+  .description('Manage vault client configuration (remote connections, identity auth)');
+
+configCmd
+  .command('set <field> <value>')
+  .description(
+    'Set a configuration value. Fields: remote-url, identity, key-file, ca-cert',
+  )
+  .action((field: string, value: string) => {
+    try {
+      const resolved = resolveFieldName(field);
+      if (!resolved) {
+        process.stderr.write(
+          `Error: Unknown config field '${field}'.\n` +
+            `Valid fields: ${getValidFields().map((f) => f.replace(/_/g, '-')).join(', ')}\n`,
+        );
+        process.exit(1);
+      }
+
+      setConfigField(resolved, value);
+      process.stderr.write(`Set ${field} = ${value}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : err}\n`,
+      );
+      process.exit(1);
+    }
+  });
+
+configCmd
+  .command('show')
+  .description('Display current configuration (private key paths redacted)')
+  .option('--json', 'Output as JSON')
+  .action((opts) => {
+    try {
+      const config = readConfig();
+      const display = formatConfigForDisplay(config);
+
+      if (Object.keys(display).length === 0) {
+        process.stderr.write('No configuration set.\n');
+        process.stderr.write(
+          `Config file: ${getDefaultConfigPath()}\n`,
+        );
+        process.stderr.write(
+          '\nSet values with: hq-vault config set <field> <value>\n',
+        );
+        process.stderr.write(
+          `Valid fields: ${getValidFields().map((f) => f.replace(/_/g, '-')).join(', ')}\n`,
+        );
+        return;
+      }
+
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(display, null, 2) + '\n');
+      } else {
+        process.stdout.write('Current configuration:\n\n');
+        for (const [key, val] of Object.entries(display)) {
+          process.stdout.write(`  ${key.padEnd(14)} ${val}\n`);
+        }
+        process.stdout.write(
+          `\nConfig file: ${getDefaultConfigPath()}\n`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : err}\n`,
+      );
+      process.exit(1);
+    }
+  });
+
+configCmd
+  .command('unset <field>')
+  .description('Remove a configuration value')
+  .action((field: string) => {
+    try {
+      const resolved = resolveFieldName(field);
+      if (!resolved) {
+        process.stderr.write(
+          `Error: Unknown config field '${field}'.\n` +
+            `Valid fields: ${getValidFields().map((f) => f.replace(/_/g, '-')).join(', ')}\n`,
+        );
+        process.exit(1);
+      }
+
+      const config = readConfig();
+      delete config[resolved];
+      writeConfig(config);
+      process.stderr.write(`Unset ${field}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : err}\n`,
+      );
       process.exit(1);
     }
   });

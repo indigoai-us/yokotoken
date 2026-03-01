@@ -115,3 +115,26 @@ export type {
   MemberRole,
   IdentityCreateResult,
 } from './identity.js';
+export {
+  NetworkVaultClient,
+  NetworkClientError,
+} from './network-client.js';
+export type {
+  NetworkClientConfig,
+  NetworkClientResponse,
+} from './network-client.js';
+export {
+  readConfig,
+  writeConfig,
+  setConfigField,
+  getConfigField,
+  deleteConfigField,
+  resolveFieldName,
+  formatConfigForDisplay,
+  getDefaultConfigPath,
+  getValidFields,
+} from './config.js';
+export type {
+  VaultConfig,
+  VaultConfigField,
+} from './config.js';
