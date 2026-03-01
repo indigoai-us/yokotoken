@@ -1,0 +1,744 @@
+/**
+ * Vault server — holds the master key in memory and serves lock/unlock/status
+ * requests via a local HTTPS server bound to localhost only.
+ *
+ * The server runs as the "vault daemon" and is the only process that ever
+ * holds the decryption key. CLI commands communicate with it via HTTPS on
+ * a localhost port.
+ *
+ * Features:
+ * - Holds master key in memory while unlocked
+ * - Auto-lock after configurable idle timeout (default: 30 minutes)
+ * - Localhost-only binding (never exposed to network)
+ * - PID file for process management
+ * - HTTPS with self-signed certificates (US-004)
+ * - Bearer token authentication on all endpoints (US-004)
+ * - Rate limiting on failed auth attempts (US-004)
+ */
+
+import https from 'node:https';
+import http from 'node:http';
+import { VaultEngine } from './vault.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  generateToken,
+  writeTokenFile,
+  validateBearerToken,
+  RateLimiter,
+  type RateLimitConfig,
+} from './auth.js';
+import { ensureCerts, type TlsCertPaths, type TlsCertData } from './tls.js';
+import { TokenManager } from './tokens.js';
+import { VaultDatabase } from './db.js';
+import { AuditLogger } from './audit.js';
+
+export interface ServerConfig {
+  vaultPath: string;
+  port: number;
+  idleTimeoutMs: number;
+  pidFile: string;
+  portFile: string;
+  tokenFile?: string;
+  tlsCertPaths?: TlsCertPaths;
+  tlsCertData?: TlsCertData;
+  rateLimitConfig?: Partial<RateLimitConfig>;
+  /** If true, skip TLS and use plain HTTP (for testing only). */
+  insecure?: boolean;
+  /** Provide a pre-set token instead of generating one. */
+  token?: string;
+  /** Custom audit log path (defaults to ~/.hq-vault/audit.log). */
+  auditLogPath?: string;
+}
+
+export const DEFAULT_PORT = 13100;
+export const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+/**
+ * Get the default vault directory path.
+ * Respects HQ_VAULT_DIR environment variable for testing and custom deployments.
+ */
+export function getVaultDir(): string {
+  if (process.env.HQ_VAULT_DIR) {
+    return process.env.HQ_VAULT_DIR;
+  }
+  const home = process.env.HOME || process.env.USERPROFILE || '';
+  return path.join(home, '.hq-vault');
+}
+
+/**
+ * Get the default vault database path.
+ */
+export function getDefaultVaultPath(): string {
+  return path.join(getVaultDir(), 'vault.db');
+}
+
+/**
+ * Get the default PID file path.
+ */
+export function getDefaultPidFile(): string {
+  return path.join(getVaultDir(), 'vault.pid');
+}
+
+/**
+ * Get the default port file path.
+ */
+export function getDefaultPortFile(): string {
+  return path.join(getVaultDir(), 'vault.port');
+}
+
+interface ServerState {
+  vault: VaultEngine;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  idleTimeoutMs: number;
+  lastActivity: number;
+  boundPort: number;
+  /** Bootstrap/admin token (from file). Always accepted for backward compat. */
+  token: string;
+  rateLimiter: RateLimiter;
+  /** Token manager for database-backed multi-token system (US-005). */
+  tokenManager: TokenManager;
+  /** Token database connection (separate from VaultEngine's). */
+  tokenDb: VaultDatabase;
+  /** Audit logger for recording access and auth events. */
+  auditLogger: AuditLogger;
+}
+
+/**
+ * Reset the auto-lock idle timer.
+ */
+function resetIdleTimer(state: ServerState): void {
+  if (state.idleTimer) {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+  }
+  state.lastActivity = Date.now();
+
+  if (state.vault.isUnlocked && state.idleTimeoutMs > 0) {
+    state.idleTimer = setTimeout(() => {
+      if (state.vault.isUnlocked) {
+        state.vault.lock();
+        process.stderr.write('[hq-vault] Auto-locked after idle timeout\n');
+      }
+    }, state.idleTimeoutMs);
+    // Don't prevent process exit
+    state.idleTimer.unref();
+  }
+}
+
+/**
+ * Parse JSON body from an incoming request.
+ */
+function parseBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        const body = Buffer.concat(chunks).toString('utf-8');
+        if (!body || body.trim().length === 0) {
+          resolve({});
+        } else {
+          resolve(JSON.parse(body));
+        }
+      } catch {
+        reject(new Error('Invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * Send a JSON response.
+ */
+function sendJson(res: http.ServerResponse, statusCode: number, data: unknown): void {
+  const body = JSON.stringify(data);
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+/**
+ * Get the client IP from a request, normalizing IPv6-mapped IPv4 addresses.
+ */
+function getClientIp(req: http.IncomingMessage): string {
+  const addr = req.socket.remoteAddress || 'unknown';
+  // Normalize ::ffff:127.0.0.1 to 127.0.0.1
+  if (addr.startsWith('::ffff:')) {
+    return addr.slice(7);
+  }
+  return addr;
+}
+
+/**
+ * Create the request handler function for the vault server.
+ * This is separated from server creation for testability.
+ */
+function createRequestHandler(config: ServerConfig, state: ServerState) {
+  return async (req: http.IncomingMessage, res: http.ServerResponse) => {
+    // Only allow localhost connections
+    const remoteAddr = req.socket.remoteAddress;
+    if (remoteAddr !== '127.0.0.1' && remoteAddr !== '::1' && remoteAddr !== '::ffff:127.0.0.1') {
+      sendJson(res, 403, { error: 'Forbidden' });
+      return;
+    }
+
+    const clientIp = getClientIp(req);
+
+    // ── Rate limit check ──────────────────────────────────────────
+    const lockoutMs = state.rateLimiter.isLocked(clientIp);
+    if (lockoutMs > 0) {
+      sendJson(res, 429, { error: 'Too many failed attempts. Try again later.' });
+      return;
+    }
+
+    // ── Bearer token auth ─────────────────────────────────────────
+    const authHeader = req.headers['authorization'] as string | undefined;
+
+    // Extract the raw bearer token from the header
+    let bearerToken: string | null = null;
+    if (authHeader) {
+      const parts = authHeader.split(' ');
+      if (parts.length === 2 && parts[0] === 'Bearer') {
+        bearerToken = parts[1];
+      }
+    }
+
+    // Try bootstrap token first, then managed tokens
+    let authOk = false;
+    let authenticatedTokenName = 'bootstrap';
+    if (bearerToken && validateBearerToken(authHeader, state.token)) {
+      authOk = true;
+      authenticatedTokenName = 'bootstrap';
+    } else if (bearerToken) {
+      // Try managed token validation (US-005)
+      const result = state.tokenManager.validate(bearerToken);
+      if (result.valid) {
+        authOk = true;
+        authenticatedTokenName = result.tokenName || 'unknown';
+      } else if (result.reason === 'expired') {
+        // Expired tokens return 401
+        state.auditLogger.logAuthFailure(clientIp, `token expired: ${result.tokenName || 'unknown'}`);
+        const nowLocked = state.rateLimiter.recordFailure(clientIp);
+        if (nowLocked) {
+          sendJson(res, 429, { error: 'Too many failed attempts. Try again later.' });
+        } else {
+          sendJson(res, 401, { error: 'Unauthorized' });
+        }
+        return;
+      } else if (result.reason === 'max_uses_exceeded') {
+        // Max-uses-exceeded tokens return 401
+        state.auditLogger.logAuthFailure(clientIp, `max uses exceeded: ${result.tokenName || 'unknown'}`);
+        const nowLocked = state.rateLimiter.recordFailure(clientIp);
+        if (nowLocked) {
+          sendJson(res, 429, { error: 'Too many failed attempts. Try again later.' });
+        } else {
+          sendJson(res, 401, { error: 'Unauthorized' });
+        }
+        return;
+      }
+    }
+
+    if (!authOk) {
+      state.auditLogger.logAuthFailure(clientIp, 'invalid token');
+      const nowLocked = state.rateLimiter.recordFailure(clientIp);
+      if (nowLocked) {
+        sendJson(res, 429, { error: 'Too many failed attempts. Try again later.' });
+      } else {
+        // Return 401 with no information leakage
+        sendJson(res, 401, { error: 'Unauthorized' });
+      }
+      return;
+    }
+
+    // Auth succeeded — clear any failure history
+    state.rateLimiter.recordSuccess(clientIp);
+
+    try {
+      const url = new URL(req.url || '/', `https://localhost:${config.port}`);
+      const pathname = url.pathname;
+
+      // POST /v1/init — Initialize a new vault
+      if (req.method === 'POST' && pathname === '/v1/init') {
+        const body = await parseBody(req);
+        const passphrase = body.passphrase as string;
+        const force = body.force as boolean;
+
+        if (!passphrase || typeof passphrase !== 'string') {
+          sendJson(res, 400, { error: 'Passphrase is required' });
+          return;
+        }
+
+        if (state.vault.isInitialized && !force) {
+          sendJson(res, 409, { error: 'Vault is already initialized. Use --force to reinitialize.' });
+          return;
+        }
+
+        if (state.vault.isInitialized && force) {
+          // Close the existing vault and token manager DB before deleting files
+          state.vault.close();
+          try { state.tokenDb.close(); } catch { /* ok */ }
+          if (fs.existsSync(config.vaultPath)) {
+            fs.unlinkSync(config.vaultPath);
+            // Also remove WAL and SHM files if they exist
+            const walPath = config.vaultPath + '-wal';
+            const shmPath = config.vaultPath + '-shm';
+            if (fs.existsSync(walPath)) fs.unlinkSync(walPath);
+            if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
+          }
+          state.vault = new VaultEngine(config.vaultPath);
+          // Recreate token manager with fresh DB connection
+          state.tokenDb = new VaultDatabase(config.vaultPath);
+          state.tokenManager = new TokenManager(state.tokenDb);
+        }
+
+        state.vault.init(passphrase);
+        resetIdleTimer(state);
+        sendJson(res, 200, {
+          ok: true,
+          message: 'Vault initialized and unlocked',
+          vaultPath: config.vaultPath,
+        });
+        return;
+      }
+
+      // POST /v1/unlock — Unlock the vault
+      if (req.method === 'POST' && pathname === '/v1/unlock') {
+        const body = await parseBody(req);
+        const passphrase = body.passphrase as string;
+
+        if (!passphrase || typeof passphrase !== 'string') {
+          sendJson(res, 400, { error: 'Passphrase is required' });
+          return;
+        }
+
+        if (!state.vault.isInitialized) {
+          sendJson(res, 400, { error: 'Vault is not initialized. Run `hq-vault init` first.' });
+          return;
+        }
+
+        if (state.vault.isUnlocked) {
+          resetIdleTimer(state);
+          sendJson(res, 200, { ok: true, message: 'Vault is already unlocked' });
+          return;
+        }
+
+        try {
+          state.vault.unlock(passphrase);
+          resetIdleTimer(state);
+          sendJson(res, 200, { ok: true, message: 'Vault unlocked' });
+        } catch {
+          sendJson(res, 401, { error: 'Invalid passphrase' });
+        }
+        return;
+      }
+
+      // POST /v1/lock — Lock the vault
+      if (req.method === 'POST' && pathname === '/v1/lock') {
+        if (state.idleTimer) {
+          clearTimeout(state.idleTimer);
+          state.idleTimer = null;
+        }
+        state.vault.lock();
+        sendJson(res, 200, { ok: true, message: 'Vault locked' });
+        return;
+      }
+
+      // GET /v1/status — Get vault status
+      if (req.method === 'GET' && pathname === '/v1/status') {
+        resetIdleTimer(state);
+        const status = state.vault.status();
+        sendJson(res, 200, {
+          ...status,
+          serverRunning: true,
+          port: state.boundPort,
+          idleTimeoutMs: state.idleTimeoutMs,
+          lastActivity: new Date(state.lastActivity).toISOString(),
+        });
+        return;
+      }
+
+      // ─── Secret management endpoints (US-003) ────────────────────────
+
+      // PUT /v1/secrets/:path — Store a secret
+      if (req.method === 'PUT' && pathname.startsWith('/v1/secrets/')) {
+        const secretPath = decodeURIComponent(pathname.slice('/v1/secrets/'.length));
+        if (!secretPath) {
+          sendJson(res, 400, { error: 'Secret path is required' });
+          return;
+        }
+
+        if (!state.vault.isUnlocked) {
+          sendJson(res, 403, { error: 'Vault is locked. Unlock it first.' });
+          return;
+        }
+
+        const body = await parseBody(req);
+        const value = body.value as string | undefined;
+        if (value === undefined || value === null || typeof value !== 'string') {
+          sendJson(res, 400, { error: 'Secret value is required (string)' });
+          return;
+        }
+
+        const metadata: Record<string, string | undefined> = {};
+        if (body.type && typeof body.type === 'string') metadata.type = body.type;
+        if (body.description && typeof body.description === 'string') metadata.description = body.description;
+
+        try {
+          state.vault.store(secretPath, value, metadata);
+          resetIdleTimer(state);
+          // Audit: log store operation (never log the secret value)
+          state.auditLogger.logAccess('secret.store', {
+            tokenName: authenticatedTokenName,
+            secretPath,
+            ip: clientIp,
+          });
+          sendJson(res, 200, {
+            ok: true,
+            path: secretPath,
+            bytes: Buffer.byteLength(value, 'utf-8'),
+            metadata,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to store secret';
+          sendJson(res, 400, { error: message });
+        }
+        return;
+      }
+
+      // GET /v1/secrets?prefix= — List secrets by prefix
+      if (req.method === 'GET' && pathname === '/v1/secrets') {
+        if (!state.vault.isUnlocked) {
+          sendJson(res, 403, { error: 'Vault is locked. Unlock it first.' });
+          return;
+        }
+
+        const url2 = new URL(req.url || '/', `https://localhost:${config.port}`);
+        const prefix = url2.searchParams.get('prefix') || undefined;
+
+        try {
+          const entries = state.vault.list(prefix);
+          resetIdleTimer(state);
+          // Audit: log list operation
+          state.auditLogger.logAccess('secret.list', {
+            tokenName: authenticatedTokenName,
+            ip: clientIp,
+            detail: prefix ? `prefix=${prefix}` : null,
+          });
+          sendJson(res, 200, { entries });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to list secrets';
+          sendJson(res, 500, { error: message });
+        }
+        return;
+      }
+
+      // GET /v1/secrets/:path — Get a decrypted secret
+      if (req.method === 'GET' && pathname.startsWith('/v1/secrets/')) {
+        const secretPath = decodeURIComponent(pathname.slice('/v1/secrets/'.length));
+        if (!secretPath) {
+          sendJson(res, 400, { error: 'Secret path is required' });
+          return;
+        }
+
+        if (!state.vault.isUnlocked) {
+          sendJson(res, 403, { error: 'Vault is locked. Unlock it first.' });
+          return;
+        }
+
+        try {
+          const entry = state.vault.get(secretPath);
+          resetIdleTimer(state);
+          if (!entry) {
+            sendJson(res, 404, { error: `Secret not found: ${secretPath}` });
+            return;
+          }
+          // Audit: log get operation (never log the secret value)
+          state.auditLogger.logAccess('secret.get', {
+            tokenName: authenticatedTokenName,
+            secretPath,
+            ip: clientIp,
+          });
+          sendJson(res, 200, {
+            path: entry.path,
+            value: entry.value,
+            metadata: entry.metadata,
+            createdAt: entry.createdAt,
+            updatedAt: entry.updatedAt,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to get secret';
+          sendJson(res, 500, { error: message });
+        }
+        return;
+      }
+
+      // DELETE /v1/secrets/:path — Delete a secret
+      if (req.method === 'DELETE' && pathname.startsWith('/v1/secrets/')) {
+        const secretPath = decodeURIComponent(pathname.slice('/v1/secrets/'.length));
+        if (!secretPath) {
+          sendJson(res, 400, { error: 'Secret path is required' });
+          return;
+        }
+
+        if (!state.vault.isUnlocked) {
+          sendJson(res, 403, { error: 'Vault is locked. Unlock it first.' });
+          return;
+        }
+
+        try {
+          const deleted = state.vault.delete(secretPath);
+          resetIdleTimer(state);
+          if (!deleted) {
+            sendJson(res, 404, { error: `Secret not found: ${secretPath}` });
+            return;
+          }
+          // Audit: log delete operation
+          state.auditLogger.logAccess('secret.delete', {
+            tokenName: authenticatedTokenName,
+            secretPath,
+            ip: clientIp,
+          });
+          sendJson(res, 200, { ok: true, path: secretPath, message: 'Secret deleted' });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to delete secret';
+          sendJson(res, 400, { error: message });
+        }
+        return;
+      }
+
+      // ─── Token management endpoints (US-005) ──────────────────────────
+
+      // POST /v1/tokens — Create a new access token
+      if (req.method === 'POST' && pathname === '/v1/tokens') {
+        const body = await parseBody(req);
+        const name = body.name as string | undefined;
+        const ttl = body.ttl as string | undefined;
+        const maxUses = body.max_uses as number | undefined;
+
+        if (!name || typeof name !== 'string' || name.trim().length === 0) {
+          sendJson(res, 400, { error: 'Token name is required' });
+          return;
+        }
+
+        try {
+          const result = state.tokenManager.create({
+            name: name.trim(),
+            ttl: ttl || null,
+            maxUses: maxUses ?? null,
+          });
+          resetIdleTimer(state);
+          sendJson(res, 201, {
+            ok: true,
+            token: result.token,
+            metadata: result.metadata,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to create token';
+          sendJson(res, 400, { error: message });
+        }
+        return;
+      }
+
+      // GET /v1/tokens — List all tokens (metadata only)
+      if (req.method === 'GET' && pathname === '/v1/tokens') {
+        try {
+          const tokens = state.tokenManager.list();
+          resetIdleTimer(state);
+          sendJson(res, 200, { tokens });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to list tokens';
+          sendJson(res, 500, { error: message });
+        }
+        return;
+      }
+
+      // DELETE /v1/tokens/:name — Revoke a token
+      if (req.method === 'DELETE' && pathname.startsWith('/v1/tokens/')) {
+        const tokenName = decodeURIComponent(pathname.slice('/v1/tokens/'.length));
+        if (!tokenName) {
+          sendJson(res, 400, { error: 'Token name is required' });
+          return;
+        }
+
+        try {
+          const revoked = state.tokenManager.revoke(tokenName);
+          resetIdleTimer(state);
+          if (!revoked) {
+            sendJson(res, 404, { error: `Token not found: ${tokenName}` });
+            return;
+          }
+          sendJson(res, 200, { ok: true, name: tokenName, message: 'Token revoked' });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to revoke token';
+          sendJson(res, 400, { error: message });
+        }
+        return;
+      }
+
+      // POST /v1/shutdown — Graceful shutdown
+      if (req.method === 'POST' && pathname === '/v1/shutdown') {
+        state.vault.lock();
+        sendJson(res, 200, { ok: true, message: 'Server shutting down' });
+        // Give response time to flush, then shut down
+        setTimeout(() => {
+          cleanup(config, state, server);
+          process.exit(0);
+        }, 100);
+        return;
+      }
+
+      // 404 for everything else
+      sendJson(res, 404, { error: 'Not found' });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Internal server error';
+      sendJson(res, 500, { error: message });
+    }
+  };
+}
+
+// We store a reference so the shutdown handler can use it
+let server: https.Server | http.Server;
+
+/**
+ * Create and start the vault server.
+ *
+ * By default uses HTTPS with auto-generated self-signed certificates.
+ * Pass `insecure: true` in config for plain HTTP (testing only).
+ */
+export function createVaultServer(config: ServerConfig): Promise<https.Server | http.Server> {
+  // Generate or retrieve the bearer token
+  const tokenFile = config.tokenFile || path.join(path.dirname(config.pidFile), 'token');
+  const token = config.token || generateToken();
+
+  // Write the token file
+  writeTokenFile(tokenFile, token);
+
+  // Open a database connection for the token manager (separate from VaultEngine's)
+  const tokenDb = new VaultDatabase(config.vaultPath);
+  const tokenManager = new TokenManager(tokenDb);
+
+  // Initialize the audit logger
+  const auditLogger = new AuditLogger(config.auditLogPath);
+
+  const state: ServerState = {
+    vault: new VaultEngine(config.vaultPath),
+    idleTimer: null,
+    idleTimeoutMs: config.idleTimeoutMs,
+    lastActivity: Date.now(),
+    boundPort: config.port,
+    token,
+    rateLimiter: new RateLimiter(config.rateLimitConfig),
+    tokenManager,
+    tokenDb,
+    auditLogger,
+  };
+
+  const handler = createRequestHandler(config, state);
+
+  if (config.insecure) {
+    // Plain HTTP for testing
+    server = http.createServer(handler);
+  } else {
+    // HTTPS with self-signed certs
+    const certData = config.tlsCertData || ensureCerts(config.tlsCertPaths);
+    server = https.createServer(
+      {
+        cert: certData.cert,
+        key: certData.key,
+      },
+      handler,
+    );
+  }
+
+  // Handle process signals for clean shutdown
+  const onSignal = () => {
+    cleanup(config, state, server);
+    process.exit(0);
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  return new Promise((resolve, reject) => {
+    server.listen(config.port, '127.0.0.1', () => {
+      // Capture actual bound port (important when config.port is 0)
+      const addr = server.address();
+      if (typeof addr === 'object' && addr) {
+        state.boundPort = addr.port;
+      }
+
+      // Write PID file
+      const dir = path.dirname(config.pidFile);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(config.pidFile, process.pid.toString(), 'utf-8');
+
+      // Write port file (use actual bound port)
+      fs.writeFileSync(config.portFile, state.boundPort.toString(), 'utf-8');
+
+      resolve(server);
+    });
+
+    server.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+/**
+ * Clean up PID file, port file, idle timer, and lock the vault.
+ */
+function cleanup(config: ServerConfig, state: ServerState, srv: https.Server | http.Server): void {
+  if (state.idleTimer) {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+  }
+  try { state.vault.close(); } catch { /* ok */ }
+  try { state.tokenDb.close(); } catch { /* ok */ }
+  try { state.auditLogger.close(); } catch { /* ok */ }
+  try { if (fs.existsSync(config.pidFile)) fs.unlinkSync(config.pidFile); } catch { /* ok */ }
+  try { if (fs.existsSync(config.portFile)) fs.unlinkSync(config.portFile); } catch { /* ok */ }
+  try { srv.close(); } catch { /* ok */ }
+}
+
+/**
+ * Check if a vault server is already running by reading the PID file.
+ */
+export function isServerRunning(pidFile: string): { running: boolean; pid?: number } {
+  if (!fs.existsSync(pidFile)) {
+    return { running: false };
+  }
+
+  const pidStr = fs.readFileSync(pidFile, 'utf-8').trim();
+  const pid = parseInt(pidStr, 10);
+  if (isNaN(pid)) {
+    return { running: false };
+  }
+
+  try {
+    // Sending signal 0 checks if process exists without killing it
+    process.kill(pid, 0);
+    return { running: true, pid };
+  } catch {
+    // Process doesn't exist — stale PID file
+    try { fs.unlinkSync(pidFile); } catch { /* ok */ }
+    return { running: false };
+  }
+}
+
+/**
+ * Read the port from the port file.
+ */
+export function readServerPort(portFile: string): number | null {
+  if (!fs.existsSync(portFile)) {
+    return null;
+  }
+
+  const portStr = fs.readFileSync(portFile, 'utf-8').trim();
+  const port = parseInt(portStr, 10);
+  return isNaN(port) ? null : port;
+}

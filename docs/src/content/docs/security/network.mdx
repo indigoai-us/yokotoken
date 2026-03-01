@@ -1,0 +1,91 @@
+---
+title: Network Mode (Planned)
+description: Federated vault access for distributed teams and remote agents.
+sidebar:
+  order: 2
+---
+
+import { Aside } from "@astrojs/starlight/components";
+
+<Aside type="note">
+  Network mode is planned for a future release. This page describes the design —
+  the current release is localhost-only.
+</Aside>
+
+## Overview
+
+Network mode extends HQ Vault for distributed teams: remote agents connect over HTTPS, authenticate with Ed25519 keypairs, and access credentials scoped to their org and project memberships.
+
+## Architecture
+
+```
+Remote Agent                         Vault Server (network mode)
+┌─────────────┐                      ┌──────────────────────────┐
+│ Ed25519     │  1. Challenge req    │                          │
+│ private key │ ──────────────────→  │  Identity DB             │
+│             │  2. Nonce            │  ┌──────────────────┐    │
+│             │ ←──────────────────  │  │ identities       │    │
+│             │  3. Signed nonce     │  │ orgs             │    │
+│             │ ──────────────────→  │  │ projects         │    │
+│             │  4. Session token    │  │ memberships      │    │
+│             │ ←──────────────────  │  │ access_requests  │    │
+│             │                      │  └──────────────────┘    │
+│             │  5. GET /v1/secrets  │                          │
+│             │ ──────────────────→  │  Vault DB (encrypted)    │
+│             │  6. Scoped secret    │  ┌──────────────────┐    │
+│             │ ←──────────────────  │  │ secrets scoped   │    │
+└─────────────┘                      │  │ by org/project   │    │
+                                     │  └──────────────────┘    │
+Human Admin (CLI)                    │                          │
+┌─────────────┐                      │  Audit Log (JSONL)       │
+│ hq-vault    │  approve/deny        │  ┌──────────────────┐    │
+│ access-     │ ──────────────────→  │  │ every operation  │    │
+│ requests    │                      │  │ identity-tagged  │    │
+└─────────────┘                      │  └──────────────────┘    │
+                                     └──────────────────────────┘
+```
+
+## Agent Access Flow
+
+1. **Agent creates identity:** `hq-vault identity create --name "deploy-bot" --type agent` — generates Ed25519 keypair
+2. **Agent requests access:** `POST /v1/access-requests` with org, project, role, and justification
+3. **Human approves:** `hq-vault access-requests approve <id>` — creates membership
+4. **Agent authenticates:** Challenge-response with Ed25519 signature — receives session token (1hr TTL)
+5. **Agent accesses secrets:** `GET /v1/secrets/org/indigo/project/hq-cloud/aws/key` — scoped to approved memberships
+
+## Secret Scoping
+
+Secrets in network mode use hierarchical paths with org and project prefixes:
+
+```
+org/<org-name>/project/<project-name>/<path>
+```
+
+Access control:
+- **Admin:** Can read/write all secrets in the org
+- **Member:** Can read/write secrets in their assigned projects
+- **Readonly:** Can read secrets in their assigned projects
+
+Unscoped local-mode secrets remain accessible to the bootstrap token for backward compatibility.
+
+## Security Principles
+
+1. **Zero trust by default** — network mode requires identity auth, no bootstrap token
+2. **Human-in-the-loop** — agents cannot self-authorize access
+3. **Least privilege** — org/project scoping limits blast radius
+4. **Cryptographic identity** — Ed25519 keypairs, never passwords
+5. **Everything is audited** — every operation tagged with identity
+6. **Stateless auth** — server stores only public key hashes
+
+## Deployment
+
+Network mode will be deployable as a Docker container:
+
+```bash
+docker run -d \
+  -v vault-data:/data \
+  -p 13100:13100 \
+  hq-vault serve --network
+```
+
+With docker-compose for persistent storage, TLS configuration, and health checks.

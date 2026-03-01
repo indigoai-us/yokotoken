@@ -1,0 +1,91 @@
+---
+title: Installation
+description: Install and initialize HQ Vault.
+sidebar:
+  order: 1
+---
+
+## Prerequisites
+
+- **Node.js** 20.0.0 or later
+- A C++ compiler toolchain (for sodium-native native bindings):
+  - **Windows:** Visual Studio Build Tools or `npm install --global windows-build-tools`
+  - **macOS:** Xcode Command Line Tools (`xcode-select --install`)
+  - **Linux:** `build-essential` package
+
+## Install
+
+```bash
+npm install -g hq-vault
+```
+
+Or install locally in a project:
+
+```bash
+npm install hq-vault
+```
+
+## Initialize a Vault
+
+```bash
+hq-vault init
+```
+
+You'll be prompted to set a master passphrase. This passphrase derives the encryption key via Argon2id — choose something strong and memorable.
+
+```
+🔐 Creating new vault at ~/.hq-vault/vault.db
+Enter master passphrase: ********
+Confirm passphrase: ********
+✅ Vault initialized and unlocked
+```
+
+The vault file is a single portable SQLite database at `~/.hq-vault/vault.db`. All secrets are encrypted at rest.
+
+## Start the Server
+
+```bash
+hq-vault serve
+```
+
+This starts the vault daemon on `https://localhost:13100`. The master key is held in memory — secrets can be retrieved without re-entering the passphrase.
+
+For background operation:
+
+```bash
+hq-vault serve --daemon
+```
+
+## Store Your First Secret
+
+```bash
+hq-vault store aws/access-key
+```
+
+You'll be prompted to paste the secret value (input is hidden):
+
+```
+Enter secret value: ********
+✅ Stored: aws/access-key (24 bytes)
+```
+
+## Retrieve It
+
+```bash
+hq-vault get aws/access-key
+```
+
+Or from code, using the SDK:
+
+```typescript
+import { getSecret } from "hq-vault";
+
+const key = await getSecret("aws/access-key");
+```
+
+## Next Steps
+
+- [Store and manage secrets](/cli/secrets/) via CLI
+- [Create access tokens](/cli/tokens/) for agents
+- [Use the HTTP API](/api/secrets/) programmatically
+- [Use the SDK](/sdk/usage/) in worker code

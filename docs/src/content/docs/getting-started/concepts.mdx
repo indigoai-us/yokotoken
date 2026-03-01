@@ -1,0 +1,104 @@
+---
+title: Concepts
+description: Key concepts and architecture of HQ Vault.
+sidebar:
+  order: 2
+---
+
+## Architecture
+
+HQ Vault is a **local daemon** that holds your master key in memory and serves secrets over a localhost HTTPS API. It's designed for AI agent workflows where secrets must be accessible programmatically but never exposed in conversation context.
+
+```
+┌─────────────────────────────────────────────┐
+│                  HQ Vault                    │
+│                                              │
+│  ┌──────────┐  ┌──────────┐  ┌───────────┐  │
+│  │  CLI     │  │  HTTP    │  │  SDK      │  │
+│  │  (stdin) │  │  Server  │  │  (Node.js)│  │
+│  └────┬─────┘  └────┬─────┘  └─────┬─────┘  │
+│       │              │              │         │
+│       └──────────┬───┘──────────────┘         │
+│                  │                            │
+│           ┌──────┴──────┐                     │
+│           │ Vault Engine│                     │
+│           │  (encrypt/  │                     │
+│           │   decrypt)  │                     │
+│           └──────┬──────┘                     │
+│                  │                            │
+│           ┌──────┴──────┐                     │
+│           │  vault.db   │                     │
+│           │  (SQLite +  │                     │
+│           │  libsodium) │                     │
+│           └─────────────┘                     │
+└─────────────────────────────────────────────┘
+```
+
+## Secret Paths
+
+Secrets are organized by **hierarchical paths** using `/` as a separator, similar to file paths or 1Password item paths:
+
+```
+slack/indigo/user-token
+aws/us-east-1/access-key
+mongodb/atlas/connection-string
+clerk/dev/secret-key
+```
+
+This lets you organize credentials by service, environment, or project. List operations support prefix filtering — `hq-vault list aws/` shows only AWS secrets.
+
+## Access Tokens
+
+Agents authenticate to the vault using **bearer tokens**. Each token is a 32-byte cryptographically random value, displayed once on creation and stored as a SHA-256 hash.
+
+Tokens can have:
+- **TTL** (time-to-live): auto-expire after a duration (`1h`, `7d`, `90s`)
+- **Max uses**: expire after N retrievals
+- **Names**: human-readable identifiers for audit trails
+
+A **bootstrap token** is auto-generated on server start and written to `~/.hq-vault/token` for the local user. Managed tokens (created via `hq-vault token create`) provide scoped access for agents and workers.
+
+## Secure Entry
+
+The core problem: when an agent asks a user to provide a credential, the value typically appears in the conversation context. HQ Vault provides two secure entry flows:
+
+### CLI Stdin
+```bash
+hq-vault ingest slack/token
+# User pastes in terminal (echo disabled)
+# Agent only sees: "Stored: slack/token (42 bytes)"
+```
+
+### One-Time Web Page
+```bash
+hq-vault ingest slack/token --web
+# Opens a one-time HTTPS page on a random port
+# User pastes in browser, page self-destructs after submit
+# Agent only sees the confirmation
+```
+
+In both cases, the secret value **never enters the AI conversation**.
+
+## Encryption
+
+All secrets are encrypted with **XChaCha20-Poly1305** (authenticated encryption) via `sodium-native` — native C bindings to libsodium, not JavaScript crypto.
+
+The master key is derived from your passphrase using **Argon2id** with:
+- 3 iterations (opslimit MODERATE)
+- 256 MB memory (memlimit MODERATE)
+- 16-byte random salt
+- 32-byte derived key
+
+Each secret gets a unique 24-byte random nonce. The 16-byte authentication tag ensures tamper detection.
+
+## Auto-Lock
+
+The vault server automatically locks after a configurable idle timeout (default: 30 minutes). When locked, the master key is securely zeroed from memory using `sodium_memzero()`. Any vault operation resets the idle timer.
+
+## Audit Logging
+
+Every vault operation is logged to `~/.hq-vault/audit.log` (append-only JSONL):
+- Timestamp, operation type, token name, secret path, client IP
+- Secret **values are never logged**
+- Failed authentication attempts are logged
+- The audit log cannot be modified through the API

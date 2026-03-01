@@ -1,0 +1,108 @@
+---
+title: Audit & Backup
+description: CLI commands for audit logging, backup, and migration.
+sidebar:
+  order: 4
+---
+
+## Audit Logging
+
+Every vault operation is recorded in `~/.hq-vault/audit.log` — an append-only JSONL file. Secret values are **never logged**.
+
+### `hq-vault audit`
+
+View audit log entries.
+
+```bash
+# Recent entries (default: 50)
+hq-vault audit
+
+# Filter by secret path
+hq-vault audit --path aws/
+
+# Filter by token name
+hq-vault audit --token deploy-bot
+
+# Filter by time
+hq-vault audit --since 2026-02-28T00:00:00Z
+
+# Combine filters
+hq-vault audit --path slack/ --token ci-runner --limit 20
+
+# Real-time tail
+hq-vault audit --tail
+
+# JSON output
+hq-vault audit --json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--path <path>` | Filter by secret path (substring match) |
+| `--token <name>` | Filter by token name |
+| `--since <datetime>` | ISO 8601 datetime cutoff |
+| `--limit <count>` | Max entries (default: 50) |
+| `--tail` | Follow log in real-time |
+| `--json` | Output as JSON lines |
+
+Example output:
+
+```
+TIME                 OP              TOKEN        PATH
+2026-02-28 14:22:01  secret.get      deploy-bot   aws/access-key
+2026-02-28 14:21:58  secret.get      deploy-bot   aws/secret-key
+2026-02-28 14:20:15  secret.store    bootstrap    slack/indigo/token
+2026-02-28 14:18:03  auth.failure    (unknown)    —
+```
+
+Logged operations: `secret.get`, `secret.store`, `secret.delete`, `secret.list`, `auth.failure`.
+
+---
+
+## Backup & Restore
+
+### `hq-vault backup`
+
+Create an encrypted backup of the vault. The backup is encrypted with your master passphrase — safe for cloud storage or version control.
+
+```bash
+hq-vault backup ./vault-backup-2026-02-28.hqvb
+```
+
+Backup format: `HQVB` magic bytes + version + fresh salt + nonce + encrypted SQLite database.
+
+### `hq-vault restore`
+
+Restore a vault from an encrypted backup.
+
+```bash
+hq-vault restore ./vault-backup-2026-02-28.hqvb
+hq-vault restore ./vault-backup-2026-02-28.hqvb --force  # overwrite existing
+```
+
+| Flag | Description |
+|------|-------------|
+| `--force` | Overwrite existing vault without confirmation |
+
+---
+
+## Import & Export
+
+### `hq-vault export`
+
+Export secrets as `.env` format for migration or sharing.
+
+```bash
+# Export all secrets
+hq-vault export
+
+# Export a subset
+hq-vault export --prefix aws/
+
+# Write to file
+hq-vault export --output ./secrets.env
+```
+
+### `hq-vault import`
+
+Import secrets from a `.env` file (future — use `hq-vault store --file` for now).

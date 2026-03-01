@@ -1,0 +1,151 @@
+---
+title: Server API
+description: HTTP API endpoints for vault and server management.
+sidebar:
+  order: 3
+---
+
+## Initialize Vault
+
+<span class="method-post">POST</span> `/v1/init`
+
+Initialize a new vault. Only works if no vault exists (or `force: true`).
+
+**Request:**
+
+```json
+{
+  "passphrase": "my-master-passphrase",
+  "force": false
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "ok": true,
+  "message": "Vault initialized and unlocked",
+  "vaultPath": "/home/user/.hq-vault/vault.db"
+}
+```
+
+**Errors:** `409` vault already initialized (use `force: true`).
+
+---
+
+## Unlock Vault
+
+<span class="method-post">POST</span> `/v1/unlock`
+
+Unlock the vault with the master passphrase.
+
+**Request:**
+
+```json
+{
+  "passphrase": "my-master-passphrase"
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "ok": true,
+  "message": "Vault unlocked"
+}
+```
+
+**Errors:** `401` invalid passphrase.
+
+---
+
+## Lock Vault
+
+<span class="method-post">POST</span> `/v1/lock`
+
+Lock the vault immediately. Wipes the master key from memory.
+
+**Response (200):**
+
+```json
+{
+  "ok": true,
+  "message": "Vault locked"
+}
+```
+
+---
+
+## Vault Status
+
+<span class="method-get">GET</span> `/v1/status`
+
+Get current vault and server state.
+
+**Response (200):**
+
+```json
+{
+  "initialized": true,
+  "locked": false,
+  "secretCount": 12,
+  "vaultPath": "/home/user/.hq-vault/vault.db",
+  "serverRunning": true,
+  "port": 13100,
+  "idleTimeoutMs": 1800000,
+  "lastActivity": "2026-02-28T14:22:01.000Z"
+}
+```
+
+---
+
+## Shutdown Server
+
+<span class="method-post">POST</span> `/v1/shutdown`
+
+Gracefully shut down the vault server. Locks the vault and exits.
+
+**Response (200):**
+
+```json
+{
+  "ok": true,
+  "message": "Server shutting down"
+}
+```
+
+---
+
+## Authentication
+
+All endpoints (except status) require a bearer token:
+
+```
+Authorization: Bearer <token>
+```
+
+Tokens are validated with **timing-safe comparison** to prevent timing attacks. Failed authentication is rate-limited: 10 failures per minute triggers a 5-minute lockout per IP.
+
+## Error Format
+
+All errors follow a consistent format:
+
+```json
+{
+  "error": "Vault is locked",
+  "code": "VAULT_LOCKED"
+}
+```
+
+Common error codes:
+
+| Code | Status | Description |
+|------|--------|-------------|
+| `VAULT_LOCKED` | 403 | Vault must be unlocked first |
+| `NOT_FOUND` | 404 | Secret or token not found |
+| `UNAUTHORIZED` | 401 | Invalid or missing bearer token |
+| `RATE_LIMITED` | 429 | Too many failed auth attempts |
+| `ALREADY_EXISTS` | 409 | Vault already initialized |
+| `BAD_REQUEST` | 400 | Invalid input |

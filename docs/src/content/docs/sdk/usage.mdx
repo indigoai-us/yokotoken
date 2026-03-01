@@ -1,0 +1,185 @@
+---
+title: SDK Usage
+description: TypeScript/Node.js SDK for programmatic vault access.
+sidebar:
+  order: 1
+---
+
+The HQ Vault SDK provides a high-level TypeScript API for agents and workers to access secrets without dealing with HTTP requests or authentication details.
+
+## Installation
+
+```bash
+npm install hq-vault
+```
+
+## Configuration
+
+The SDK auto-discovers the vault from environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HQ_VAULT_URL` | `https://localhost:13100` | Vault server URL |
+| `HQ_VAULT_TOKEN` | — | Bearer token (required) |
+
+Or pass configuration inline:
+
+```typescript
+import { getSecret } from "hq-vault";
+
+const value = await getSecret("aws/access-key", {
+  url: "https://localhost:9000",
+  token: "NDY3MWI5N2VkYjE4NmQ0ZTg5YzRm...",
+});
+```
+
+## Functions
+
+### `getSecret(path, config?)`
+
+Retrieve a decrypted secret value.
+
+```typescript
+import { getSecret } from "hq-vault";
+
+const slackToken = await getSecret("slack/indigo/user-token");
+const awsKey = await getSecret("aws/access-key");
+```
+
+Returns the secret value as a `string`. Throws `VaultSdkError` if the secret is not found, the vault is locked, or authentication fails.
+
+### `storeSecret(path, value, metadata?, config?)`
+
+Store a secret with optional metadata.
+
+```typescript
+import { storeSecret } from "hq-vault";
+
+await storeSecret("slack/indigo/user-token", "xoxp-123456", {
+  type: "oauth-token",
+  description: "Indigo Slack user token",
+});
+```
+
+### `listSecrets(prefix?, config?)`
+
+List secrets matching a prefix. Returns metadata only — no values.
+
+```typescript
+import { listSecrets } from "hq-vault";
+
+const entries = await listSecrets("aws/");
+
+for (const entry of entries) {
+  console.log(entry.path, entry.metadata.type, entry.createdAt);
+}
+```
+
+Returns an array of `SecretEntry`:
+
+```typescript
+interface SecretEntry {
+  path: string;
+  metadata: {
+    type?: string;
+    description?: string;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+```
+
+## Error Handling
+
+All SDK functions throw `VaultSdkError` on failure:
+
+```typescript
+import { getSecret, VaultSdkError } from "hq-vault";
+
+try {
+  const value = await getSecret("missing/secret");
+} catch (err) {
+  if (err instanceof VaultSdkError) {
+    console.error(err.code); // 'NOT_FOUND', 'VAULT_LOCKED', 'UNAUTHORIZED', etc.
+    console.error(err.statusCode); // 404, 403, 401, etc.
+    console.error(err.message); // Human-readable message
+  }
+}
+```
+
+Error codes:
+
+| Code | Description |
+|------|-------------|
+| `NOT_FOUND` | Secret does not exist at the given path |
+| `VAULT_LOCKED` | Vault must be unlocked before accessing secrets |
+| `UNAUTHORIZED` | Invalid or missing token |
+| `CONNECTION_ERROR` | Could not connect to vault server |
+
+## TypeScript Exports
+
+```typescript
+// Core functions
+export function getSecret(
+  path: string,
+  config?: VaultSdkConfig,
+): Promise<string>;
+export function storeSecret(
+  path: string,
+  value: string,
+  metadata?: SecretMetadata,
+  config?: VaultSdkConfig,
+): Promise<void>;
+export function listSecrets(
+  prefix?: string,
+  config?: VaultSdkConfig,
+): Promise<SecretEntry[]>;
+
+// Types
+export interface VaultSdkConfig {
+  url?: string;
+  token?: string;
+}
+
+export interface SecretMetadata {
+  type?: string;
+  description?: string;
+}
+
+export interface SecretEntry {
+  path: string;
+  metadata: SecretMetadata;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export class VaultSdkError extends Error {
+  code: string;
+  statusCode?: number;
+}
+```
+
+## Example: Worker Integration
+
+A typical HQ worker accessing vault credentials:
+
+```typescript
+import { getSecret } from "hq-vault";
+
+async function sendSlackMessage(channel: string, text: string) {
+  const token = await getSecret("slack/indigo/user-token");
+
+  const res = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ channel, text }),
+  });
+
+  return res.json();
+}
+```
+
+The secret value is retrieved at runtime and never stored in code, environment variables, or conversation context.

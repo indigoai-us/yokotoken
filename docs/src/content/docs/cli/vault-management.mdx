@@ -1,0 +1,91 @@
+---
+title: Vault Management
+description: CLI commands for initializing, serving, and controlling the vault.
+sidebar:
+  order: 1
+---
+
+## `hq-vault init`
+
+Create a new vault. Prompts for a master passphrase via stdin (echo disabled).
+
+```bash
+hq-vault init
+hq-vault init --vault-path /custom/path/vault.db
+hq-vault init --force  # reinitialize (destroys all secrets)
+```
+
+| Flag | Description |
+|------|-------------|
+| `--vault-path <path>` | Custom vault file location (default: `~/.hq-vault/vault.db`) |
+| `--force` | Reinitialize existing vault — **destroys all secrets** |
+
+---
+
+## `hq-vault serve`
+
+Start the vault server. Holds the master key in memory so secrets can be retrieved without re-entering the passphrase.
+
+```bash
+hq-vault serve
+hq-vault serve --port 9000
+hq-vault serve --daemon
+hq-vault serve --idle-timeout 60
+hq-vault serve --insecure  # HTTP only (testing)
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port <number>` | `13100` | Server port |
+| `--vault-path <path>` | `~/.hq-vault/vault.db` | Vault file location |
+| `--idle-timeout <min>` | `30` | Auto-lock after N minutes of inactivity |
+| `--insecure` | `false` | Use plain HTTP instead of HTTPS |
+| `--daemon` | `false` | Run as background daemon |
+| `--stop` | — | Stop a running daemon |
+| `--restart` | — | Restart daemon with new options |
+
+The server binds to **localhost only** (127.0.0.1). HTTPS uses an auto-generated self-signed certificate stored in `~/.hq-vault/`.
+
+A **bootstrap token** is generated on start and written to `~/.hq-vault/token`.
+
+---
+
+## `hq-vault unlock`
+
+Unlock the vault by providing the master passphrase. Required after auto-lock or manual lock.
+
+```bash
+hq-vault unlock
+```
+
+---
+
+## `hq-vault lock`
+
+Lock the vault immediately. Wipes the master key from memory using `sodium_memzero()`.
+
+```bash
+hq-vault lock
+```
+
+---
+
+## `hq-vault status`
+
+Show vault state — locked/unlocked, secret count, server info.
+
+```bash
+hq-vault status
+hq-vault status --vault-path /custom/path/vault.db
+```
+
+Example output:
+
+```
+Vault: ~/.hq-vault/vault.db
+Status: unlocked
+Secrets: 12
+Server: running (port 13100, PID 4821)
+Idle timeout: 30 min
+Last activity: 2 min ago
+```

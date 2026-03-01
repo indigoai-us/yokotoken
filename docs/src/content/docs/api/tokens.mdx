@@ -1,0 +1,100 @@
+---
+title: Tokens API
+description: HTTP API endpoints for managing access tokens.
+sidebar:
+  order: 2
+---
+
+## Create a Token
+
+<span class="method-post">POST</span> `/v1/tokens`
+
+Create a new access token. The token value is returned **once** — store it securely.
+
+**Request:**
+
+```json
+{
+  "name": "deploy-bot",
+  "ttl": "7d",
+  "max_uses": null
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Unique human-readable identifier |
+| `ttl` | No | Time-to-live (`30m`, `1h`, `7d`, `90s`) |
+| `max_uses` | No | Maximum uses before expiry |
+
+**Response (201):**
+
+```json
+{
+  "ok": true,
+  "token": "NDY3MWI5N2VkYjE4NmQ0ZTg5YzRmMWEz...",
+  "metadata": {
+    "name": "deploy-bot",
+    "createdAt": "2026-02-28T14:30:00.000Z",
+    "expiresAt": "2026-03-07T14:30:00.000Z",
+    "lastUsedAt": null,
+    "useCount": 0,
+    "maxUses": null
+  }
+}
+```
+
+**Errors:** `400` invalid input or duplicate name.
+
+---
+
+## List Tokens
+
+<span class="method-get">GET</span> `/v1/tokens`
+
+List all tokens with metadata. Token values are **never returned**.
+
+**Response (200):**
+
+```json
+{
+  "tokens": [
+    {
+      "name": "deploy-bot",
+      "createdAt": "2026-02-28T14:30:00.000Z",
+      "expiresAt": "2026-03-07T14:30:00.000Z",
+      "lastUsedAt": "2026-02-28T15:00:00.000Z",
+      "useCount": 5,
+      "maxUses": null
+    },
+    {
+      "name": "ci-runner",
+      "createdAt": "2026-02-28T10:00:00.000Z",
+      "expiresAt": "2026-02-28T11:00:00.000Z",
+      "lastUsedAt": "2026-02-28T10:45:00.000Z",
+      "useCount": 12,
+      "maxUses": 50
+    }
+  ]
+}
+```
+
+---
+
+## Revoke a Token
+
+<span class="method-delete">DELETE</span> `/v1/tokens/:name`
+
+Revoke a token immediately. In-flight requests using this token will fail.
+
+**Response (200):**
+
+```json
+{
+  "ok": true,
+  "name": "deploy-bot",
+  "message": "Token revoked"
+}
+```
+
+**Errors:** `404` token not found.

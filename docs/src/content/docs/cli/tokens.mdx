@@ -1,0 +1,88 @@
+---
+title: Tokens
+description: CLI commands for managing access tokens.
+sidebar:
+  order: 3
+---
+
+Access tokens authenticate agents and workers to the vault HTTP API. Each token is a 32-byte cryptographically random value displayed **once** on creation — it cannot be retrieved again.
+
+## `hq-vault token create`
+
+Create a new access token.
+
+```bash
+# Basic token
+hq-vault token create --name deploy-bot
+
+# Time-limited (expires in 7 days)
+hq-vault token create --name ci-runner --ttl 7d
+
+# Use-limited (expires after 100 retrievals)
+hq-vault token create --name one-shot --max-uses 1
+
+# Both
+hq-vault token create --name worker --ttl 1h --max-uses 50
+```
+
+| Flag | Description |
+|------|-------------|
+| `--name <name>` | **Required.** Human-readable token identifier |
+| `--ttl <duration>` | Time-to-live: `30m`, `1h`, `7d`, `90s` etc. |
+| `--max-uses <count>` | Maximum number of uses before expiry |
+
+Output:
+
+```
+✅ Token created: deploy-bot
+Token: NDY3MWI5N2VkYjE4NmQ0ZTg5YzRmMWEz...
+
+⚠️  Save this token now — it cannot be displayed again.
+```
+
+TTL format supports: `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
+
+---
+
+## `hq-vault token list`
+
+List all tokens with metadata. Token values are never shown.
+
+```bash
+hq-vault token list
+```
+
+Example output:
+
+```
+NAME          CREATED        EXPIRES        USES    LAST USED
+deploy-bot    2 days ago     6 days         12/∞    1 hour ago
+ci-runner     1 hour ago     6d 23h         3/∞     30 min ago
+one-shot      5 min ago      never          0/1     never
+bootstrap     2 days ago     never          47/∞    just now
+```
+
+---
+
+## `hq-vault token revoke`
+
+Revoke a token immediately. Any in-flight requests using this token will fail.
+
+```bash
+hq-vault token revoke deploy-bot
+```
+
+---
+
+## Bootstrap Token
+
+When the server starts, it generates a **bootstrap token** and writes it to `~/.hq-vault/token`. This token has no TTL or use limit — it's the local admin token.
+
+Agents running on the same machine can read this file to authenticate:
+
+```bash
+curl -s https://localhost:13100/v1/secrets/my/secret \
+  -H "Authorization: Bearer $(cat ~/.hq-vault/token)"
+```
+
+For remote or multi-agent scenarios, create managed tokens with appropriate TTL and use limits instead.

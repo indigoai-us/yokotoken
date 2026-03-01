@@ -1,0 +1,90 @@
+---
+title: Daemon Mode
+description: Running HQ Vault as a background service.
+sidebar:
+  order: 2
+---
+
+For always-on vault access, run the server as a background daemon.
+
+## Start as Daemon
+
+```bash
+hq-vault serve --daemon
+```
+
+This detaches from the terminal and runs in the background. A PID file is written to `~/.hq-vault/vault.pid` and the port is recorded in `~/.hq-vault/vault.port`.
+
+## Stop the Daemon
+
+```bash
+hq-vault serve --stop
+```
+
+This sends a graceful shutdown signal. The vault locks and the server exits cleanly.
+
+## Restart
+
+```bash
+hq-vault serve --restart
+hq-vault serve --restart --port 9000 --idle-timeout 60
+```
+
+Restart with new options without manually stopping first.
+
+## Check Status
+
+```bash
+hq-vault status
+```
+
+```
+Vault: ~/.hq-vault/vault.db
+Status: unlocked
+Secrets: 12
+Server: running (port 13100, PID 4821)
+Idle timeout: 30 min
+Last activity: 2 min ago
+```
+
+## Auto-Lock Behavior
+
+The daemon auto-locks after the configured idle timeout (default: 30 minutes). When locked:
+
+- The master key is securely wiped from memory (`sodium_memzero`)
+- All secret retrieval requests return `403 VAULT_LOCKED`
+- Token management and status endpoints still work
+- Unlock with `hq-vault unlock` (prompts for passphrase)
+
+Any successful vault operation resets the idle timer.
+
+## Platform Notes
+
+### Windows
+
+On Windows, daemon mode runs as a background Node.js process. The PID file enables `--stop` and `--restart` to find and signal the process.
+
+### macOS / Linux
+
+Same background process model. For production deployments, consider wrapping with `systemd` (Linux) or `launchd` (macOS) for automatic restart on boot.
+
+Example systemd unit:
+
+```ini
+[Unit]
+Description=HQ Vault
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/hq-vault serve --port 13100
+ExecStop=/usr/local/bin/hq-vault serve --stop
+Restart=on-failure
+User=vault
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## Logs
+
+Server logs go to stdout in foreground mode. In daemon mode, logs are written to `~/.hq-vault/vault.log` with automatic rotation.

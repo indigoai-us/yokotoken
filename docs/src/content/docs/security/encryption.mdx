@@ -1,0 +1,100 @@
+---
+title: Encryption
+description: Cryptographic design and implementation details.
+sidebar:
+  order: 1
+---
+
+HQ Vault uses **libsodium** via the `sodium-native` package — native C bindings compiled for your platform. No JavaScript crypto is used for secret encryption.
+
+## Algorithms
+
+| Purpose | Algorithm | Parameters |
+|---------|-----------|------------|
+| Encryption | XChaCha20-Poly1305 | 32-byte key, 24-byte nonce, 16-byte MAC |
+| Key derivation | Argon2id v1.3 | opslimit=3 (MODERATE), memlimit=256MB, 16-byte salt |
+| Token hashing | SHA-256 | Full hash stored, timing-safe comparison |
+| TLS certificates | Ed25519 / RSA | Auto-generated self-signed |
+
+## How Secrets are Encrypted
+
+```
+Passphrase
+    │
+    ▼
+┌─────────────────────┐
+│  Argon2id            │  salt (16 bytes, random, stored in vault.db)
+│  opslimit=3          │
+│  memlimit=256MB      │
+│  ──────────────────→ │  master_key (32 bytes, held in memory)
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  XChaCha20-Poly1305  │  nonce (24 bytes, random per secret)
+│  ──────────────────→ │  ciphertext + MAC (16 bytes)
+└─────────────────────┘
+```
+
+Each secret gets its own random 24-byte nonce. The 16-byte authentication tag (MAC) is appended to the ciphertext, ensuring both confidentiality and tamper detection.
+
+## Key Lifecycle
+
+1. **Derivation:** On `unlock`, the passphrase + stored salt produce the master key via Argon2id
+2. **In memory:** The master key is held in a Node.js Buffer for the duration of the session
+3. **Zeroing:** On `lock` (manual or auto-idle), the key is overwritten with zeros using `sodium_memzero()`
+4. **Never stored:** The master key is never written to disk, logged, or transmitted
+
+## Argon2id Parameters
+
+The MODERATE parameters balance security and usability:
+
+| Parameter | Value | Effect |
+|-----------|-------|--------|
+| `opslimit` | 3 | 3 iterations of the hash function |
+| `memlimit` | 268,435,456 (256 MB) | Memory required per derivation |
+| `saltlen` | 16 bytes | Unique per vault |
+| `keylen` | 32 bytes | Output key size |
+
+At these settings, key derivation takes approximately 0.5-1 second on modern hardware, making brute-force attacks impractical even with purpose-built hardware.
+
+## XChaCha20-Poly1305
+
+Why XChaCha20 instead of AES-GCM:
+
+- **24-byte nonces** — safe to generate randomly without collision risk (AES-GCM uses 12-byte nonces, requiring careful counter management)
+- **No AES-NI dependency** — consistent performance across all hardware
+- **Same security level** — 256-bit key, 128-bit authentication tag
+- **libsodium default** — battle-tested implementation
+
+## Token Security
+
+Access tokens are 32-byte cryptographically random values:
+
+1. Generated via `sodium.randombytes_buf(32)`
+2. Base64url-encoded for transport
+3. Stored as SHA-256 hash (never plaintext)
+4. Validated with **timing-safe comparison** (`sodium.crypto_verify_32`)
+5. Displayed once on creation, never retrievable again
+
+## TLS
+
+The server generates a self-signed certificate on first start:
+
+- Stored in `~/.hq-vault/cert.pem` and `~/.hq-vault/key.pem`
+- Valid for localhost only
+- Prevents token sniffing even on the loopback interface
+- Can be disabled with `--insecure` for testing
+
+## Threat Model
+
+| Threat | Mitigation |
+|--------|------------|
+| Disk theft | Secrets encrypted with Argon2id-derived key |
+| Memory dump | Key zeroed on lock via `sodium_memzero` |
+| Network sniffing | HTTPS by default (self-signed) |
+| Token brute-force | Rate limiting (10 failures → 5-min lockout) |
+| Timing attacks | `crypto_verify_32` for token comparison |
+| Unauthorized access | Bearer tokens with TTL and use limits |
+| Audit evasion | Append-only log, not API-modifiable |
+| Conversation exposure | Secure entry flows bypass AI context entirely |

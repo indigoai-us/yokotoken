@@ -1,0 +1,71 @@
+---
+title: Introduction
+description: What HQ Vault is and why it exists.
+---
+
+## The problem
+
+AI agents need credentials — API keys, OAuth tokens, database URIs, certificates. Today those secrets end up in one of three places:
+
+1. **Pasted into conversation context** — the agent asks "what's your Slack token?" and the user pastes it in chat. The secret is now in the AI's context window, logged in conversation history, and potentially visible to other tools.
+
+2. **Stored in .env files** — plaintext files sitting on disk, easy to accidentally commit, impossible to scope or time-limit, no audit trail.
+
+3. **Passed as CLI arguments** — visible in process lists, shell history, and logs.
+
+None of these are acceptable for production agent workflows.
+
+## What HQ Vault does
+
+HQ Vault is a local encrypted credential store purpose-built for AI agents. It's like 1Password but with no UI — just a CLI, HTTP API, and SDK.
+
+- Secrets are encrypted at rest with XChaCha20-Poly1305 (libsodium, not JavaScript crypto)
+- A localhost daemon holds the master key in memory and serves secrets over HTTPS
+- Agents authenticate with bearer tokens — scoped by time and usage limits
+- Secure entry flows let users provide credentials without them entering conversation context
+- Every access is audit-logged
+
+## What it replaces
+
+| Before | After |
+|---|---|
+| `.env` files | `hq-vault env-file myapp/` |
+| Pasting tokens in chat | `hq-vault ingest slack/token` (echo-disabled stdin) |
+| Hardcoded API keys | `getSecret("aws/access-key")` at runtime |
+| No access control | Per-agent tokens with TTL and max-uses |
+| No audit trail | Append-only JSONL log of every operation |
+
+## Architecture
+
+```
+┌─────────────────────────────────────────┐
+│              HQ Vault                    │
+│                                          │
+│  ┌────────┐  ┌──────────┐  ┌─────────┐  │
+│  │  CLI   │  │  HTTP    │  │  SDK    │  │
+│  │ (stdin)│  │  Server  │  │ (Node)  │  │
+│  └───┬────┘  └────┬─────┘  └────┬────┘  │
+│      └────────┬───┘─────────────┘        │
+│               │                          │
+│        ┌──────┴──────┐                   │
+│        │ Vault Engine│                   │
+│        │  (encrypt / │                   │
+│        │   decrypt)  │                   │
+│        └──────┬──────┘                   │
+│               │                          │
+│        ┌──────┴──────┐                   │
+│        │  vault.db   │                   │
+│        │  (SQLite +  │                   │
+│        │  libsodium) │                   │
+│        └─────────────┘                   │
+└──────────────────────────────────────────┘
+```
+
+Three interfaces, one encrypted store. The CLI is for humans and agent-triggered commands. The HTTP API is for programmatic access. The SDK wraps the API for TypeScript workers.
+
+## Non-goals
+
+- **No UI.** This is agent-native. No web dashboard, no electron app.
+- **No cloud hosting.** Local daemon only (network mode is planned separately).
+- **No HSM integration.** Software encryption via libsodium.
+- **No multi-user sharing.** Single vault, single owner. Multi-agent access is handled via tokens.

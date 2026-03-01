@@ -1,0 +1,144 @@
+---
+title: Agent Workflows
+description: Common patterns for using HQ Vault with AI agents.
+sidebar:
+  order: 1
+---
+
+HQ Vault is purpose-built for AI agent workflows. Here are the most common patterns.
+
+## Pattern 1: Secure Credential Ingestion
+
+When an agent needs a credential it doesn't have, it should trigger the secure entry flow instead of asking the user to paste the value in chat.
+
+```bash
+# Agent runs this command
+hq-vault ingest stripe/secret-key --type api-key --description "Stripe live secret key"
+```
+
+The user sees a prompt in their terminal (echo disabled) and pastes the value. The agent only sees:
+
+```
+✅ Stored: stripe/secret-key (32 bytes, type: api-key)
+```
+
+The secret value **never enters the conversation context**.
+
+For browser-based entry (when the user isn't in the terminal):
+
+```bash
+hq-vault ingest stripe/secret-key --web
+```
+
+## Pattern 2: Scoped Worker Tokens
+
+Create a short-lived token for a specific worker task:
+
+```bash
+# Create a 1-hour token for a deployment worker
+hq-vault token create --name deploy-run-42 --ttl 1h --max-uses 10
+```
+
+Pass the token to the worker via environment variable:
+
+```bash
+HQ_VAULT_TOKEN=<token> node worker.js
+```
+
+The worker retrieves only what it needs:
+
+```typescript
+import { getSecret } from "hq-vault";
+
+const awsKey = await getSecret("aws/deploy/access-key");
+const awsSecret = await getSecret("aws/deploy/secret-key");
+```
+
+After 1 hour (or 10 uses), the token expires automatically.
+
+## Pattern 3: Replace .env Files
+
+Instead of maintaining `.env` files across projects, store everything in the vault and generate env files on demand.
+
+**Migrate existing .env:**
+
+```bash
+# Store each value
+hq-vault store myapp/database-url --file <(grep DATABASE_URL .env | cut -d= -f2-)
+hq-vault store myapp/api-key --file <(grep API_KEY .env | cut -d= -f2-)
+
+# Or store interactively
+hq-vault store myapp/database-url
+hq-vault store myapp/api-key
+```
+
+**Use in place of .env:**
+
+```bash
+# Generate a .env file
+hq-vault env-file myapp/ > .env
+
+# Or load directly into shell
+eval $(hq-vault env-file myapp/ --format export)
+
+# Then start your app
+node server.js
+```
+
+## Pattern 4: CI/CD Token Delegation
+
+For CI pipelines, create a time-limited token that can only access the secrets needed for that build:
+
+```bash
+# On developer machine
+hq-vault token create --name ci-build-main --ttl 30m --max-uses 5
+```
+
+Pass the token to CI as a secret, then in the pipeline:
+
+```bash
+export HQ_VAULT_URL=https://vault.internal:13100
+export HQ_VAULT_TOKEN=$CI_VAULT_TOKEN
+
+# Worker retrieves what it needs
+eval $(hq-vault env-file deploy/prod/ --format export)
+```
+
+## Pattern 5: Multi-Agent Orchestration
+
+When an orchestrator spawns multiple sub-agents, each gets its own scoped token:
+
+```typescript
+import { getSecret } from "hq-vault";
+
+// Orchestrator creates a token for each sub-agent
+async function spawnWorker(name: string, task: string) {
+  // Each worker gets a 1-hour, 20-use token
+  const res = await fetch("https://localhost:13100/v1/tokens", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${orchestratorToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      name: `worker-${name}-${Date.now()}`,
+      ttl: "1h",
+      max_uses: 20,
+    }),
+  });
+
+  const { token } = await res.json();
+
+  // Pass token to sub-agent
+  return runAgent(task, { HQ_VAULT_TOKEN: token });
+}
+```
+
+## Best Practices
+
+1. **Never paste secrets in chat.** Use `hq-vault ingest` or `hq-vault ingest --web` for secure entry.
+2. **Use short-lived tokens** for workers and CI. Default to `--ttl 1h` unless you need longer.
+3. **Name tokens descriptively.** `deploy-bot-prod` is better than `token-1`. Token names appear in audit logs.
+4. **Organize paths by service.** Use `service/environment/credential` patterns: `aws/prod/access-key`, `slack/indigo/bot-token`.
+5. **Monitor the audit log.** Run `hq-vault audit --tail` during multi-agent runs to watch credential access in real-time.
+6. **Revoke tokens after use.** For one-off tasks, revoke the token when the worker completes: `hq-vault token revoke <name>`.

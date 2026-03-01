@@ -1,0 +1,72 @@
+---
+title: Welcome
+description: Agent-native encrypted credential vault — keep secrets out of AI conversation context.
+---
+
+HQ Vault is an encrypted credential vault built for AI agents. It stores, retrieves, and delegates secrets without exposing them to conversation context.
+
+| What it does | How |
+|---|---|
+| Store secrets securely | XChaCha20-Poly1305 encryption via libsodium (native C bindings) |
+| Serve secrets to agents | Localhost HTTPS daemon with bearer token auth |
+| Replace .env files | `eval $(hq-vault env-file myapp/)` — encrypted storage, same workflow |
+| Delegate scoped access | Time-limited, use-limited tokens for workers and sub-agents |
+| Keep secrets out of AI context | Secure entry flows (stdin echo-disabled, one-time web page) |
+
+## Quick start
+
+```bash
+# Install
+npm install -g hq-vault
+
+# Initialize a vault
+hq-vault init
+
+# Start the daemon
+hq-vault serve --daemon
+
+# Store a secret (prompts via stdin, echo disabled)
+hq-vault store slack/indigo/user-token
+
+# Retrieve it
+hq-vault get slack/indigo/user-token
+```
+
+From an agent or worker:
+
+```typescript
+import { getSecret } from "hq-vault";
+
+const token = await getSecret("slack/indigo/user-token");
+```
+
+## How it works
+
+```
+Agent / Worker                 HQ Vault (localhost:13100)
+┌─────────────┐                ┌──────────────────┐
+│ SDK or HTTP  │  Bearer token  │                  │
+│ request      │ ─────────────→ │  Auth + decrypt  │
+│              │  secret value  │                  │
+│              │ ←───────────── │  Audit logged    │
+└─────────────┘                └──────────────────┘
+                                       │
+                                ┌──────┴──────┐
+                                │  vault.db   │
+                                │  (encrypted │
+                                │   SQLite)   │
+                                └─────────────┘
+```
+
+1. Secrets are stored via CLI or secure entry flow — values never appear in shell history or conversation
+2. The daemon holds the master key in memory, auto-locks after 30 minutes of inactivity
+3. Agents authenticate with bearer tokens and retrieve secrets over HTTPS
+4. Every access is audit-logged with timestamp, token name, operation, and path (never values)
+
+## Next
+
+- [Introduction](/getting-started/introduction/) — what this is and why it exists
+- [Installation](/getting-started/installation/) — install, init, first secret
+- [CLI Reference](/cli/vault-management/) — every command documented
+- [HTTP API](/api/secrets/) — programmatic access
+- [SDK](/sdk/usage/) — TypeScript functions for workers
