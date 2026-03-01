@@ -28,6 +28,22 @@ export interface Identity {
   type: IdentityType;
   public_key_hash: string;
   created_at: string;
+  /** Previous public key hash (set during key rotation with grace period). */
+  old_public_key_hash: string | null;
+  /** When the old key expires (ISO 8601). Null if no grace period active. */
+  old_key_expires_at: string | null;
+}
+
+export interface KeyRotationResult {
+  identity: Identity;
+  /** The new Ed25519 private key (64 bytes, base64). Shown ONCE, never stored. */
+  privateKey: string;
+  /** The new Ed25519 public key (32 bytes, base64). */
+  publicKey: string;
+  /** The old public key hash (prefix only, for reference). */
+  oldKeyHashPrefix: string;
+  /** The new public key hash (prefix only, for reference). */
+  newKeyHashPrefix: string;
 }
 
 export interface Org {
@@ -84,6 +100,7 @@ export class IdentityDatabase {
     this.db.pragma('foreign_keys = ON');
 
     this.initSchema();
+    this.migrateSchema();
   }
 
   /**
@@ -92,11 +109,13 @@ export class IdentityDatabase {
   private initSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS identities (
-        id              TEXT PRIMARY KEY,
-        name            TEXT NOT NULL,
-        type            TEXT NOT NULL CHECK(type IN ('human', 'agent')),
-        public_key_hash TEXT NOT NULL UNIQUE,
-        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        id                   TEXT PRIMARY KEY,
+        name                 TEXT NOT NULL,
+        type                 TEXT NOT NULL CHECK(type IN ('human', 'agent')),
+        public_key_hash      TEXT NOT NULL UNIQUE,
+        created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+        old_public_key_hash  TEXT,
+        old_key_expires_at   TEXT
       );
 
       CREATE TABLE IF NOT EXISTS orgs (
@@ -133,6 +152,22 @@ export class IdentityDatabase {
       CREATE INDEX IF NOT EXISTS idx_project_members_project_id ON project_members(project_id);
       CREATE INDEX IF NOT EXISTS idx_project_members_identity_id ON project_members(identity_id);
     `);
+  }
+
+  /**
+   * Migrate schema for existing databases (add columns if missing).
+   */
+  private migrateSchema(): void {
+    // Check if old_public_key_hash column exists
+    const columns = this.db.pragma('table_info(identities)') as Array<{ name: string }>;
+    const columnNames = columns.map(c => c.name);
+
+    if (!columnNames.includes('old_public_key_hash')) {
+      this.db.exec(`ALTER TABLE identities ADD COLUMN old_public_key_hash TEXT`);
+    }
+    if (!columnNames.includes('old_key_expires_at')) {
+      this.db.exec(`ALTER TABLE identities ADD COLUMN old_key_expires_at TEXT`);
+    }
   }
 
   // ─── Identity CRUD ──────────────────────────────────────────────
@@ -220,6 +255,117 @@ export class IdentityDatabase {
       'DELETE FROM identities WHERE id = ?'
     ).run(id);
     return result.changes > 0;
+  }
+
+  // ─── Key Rotation ──────────────────────────────────────────────
+
+  /**
+   * Rotate an identity's Ed25519 keypair.
+   *
+   * Generates a new keypair, updates the stored public key hash, and optionally
+   * keeps the old key valid for a grace period. The new private key is returned
+   * ONCE and never stored.
+   *
+   * @param identityId - The identity whose key to rotate.
+   * @param gracePeriodMs - Optional grace period in milliseconds during which
+   *   both old and new keys are accepted. If 0 or omitted, old key is immediately invalidated.
+   * @returns The rotation result with the new private key.
+   */
+  rotateKey(identityId: string, gracePeriodMs?: number): KeyRotationResult {
+    const identity = this.getIdentity(identityId);
+    if (!identity) {
+      throw new Error(`Identity '${identityId}' not found`);
+    }
+
+    const oldKeyHash = identity.public_key_hash;
+
+    // Generate new Ed25519 keypair
+    const publicKey = Buffer.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
+    const secretKey = Buffer.alloc(sodium.crypto_sign_SECRETKEYBYTES);
+    sodium.crypto_sign_keypair(publicKey, secretKey);
+
+    // Hash the new public key
+    const newKeyHash = crypto
+      .createHash('sha256')
+      .update(publicKey)
+      .digest('hex');
+
+    // Set grace period fields
+    let oldKeyExpiresAt: string | null = null;
+    let oldPublicKeyHash: string | null = null;
+
+    if (gracePeriodMs && gracePeriodMs > 0) {
+      oldPublicKeyHash = oldKeyHash;
+      oldKeyExpiresAt = new Date(Date.now() + gracePeriodMs).toISOString();
+    }
+
+    // Update the identity in the database
+    this.db.prepare(`
+      UPDATE identities
+      SET public_key_hash = ?,
+          old_public_key_hash = ?,
+          old_key_expires_at = ?
+      WHERE id = ?
+    `).run(newKeyHash, oldPublicKeyHash, oldKeyExpiresAt, identityId);
+
+    const updatedIdentity = this.getIdentity(identityId)!;
+
+    const result: KeyRotationResult = {
+      identity: updatedIdentity,
+      privateKey: secretKey.toString('base64'),
+      publicKey: publicKey.toString('base64'),
+      oldKeyHashPrefix: oldKeyHash.substring(0, 12),
+      newKeyHashPrefix: newKeyHash.substring(0, 12),
+    };
+
+    // Zero out the secret key buffer
+    sodium.sodium_memzero(secretKey);
+
+    return result;
+  }
+
+  /**
+   * Check if a public key hash is valid for an identity.
+   *
+   * Checks the current key hash first, then falls back to the old key hash
+   * if it exists and has not expired (grace period).
+   *
+   * @returns true if the key hash matches either the current or a valid old key.
+   */
+  isValidKeyHash(identityId: string, keyHash: string): boolean {
+    const identity = this.getIdentity(identityId);
+    if (!identity) return false;
+
+    // Check current key
+    if (identity.public_key_hash === keyHash) return true;
+
+    // Check old key within grace period
+    if (
+      identity.old_public_key_hash &&
+      identity.old_public_key_hash === keyHash &&
+      identity.old_key_expires_at
+    ) {
+      const expiresAt = new Date(identity.old_key_expires_at).getTime();
+      if (Date.now() <= expiresAt) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Clear expired old key hashes. Called during cleanup or rotation.
+   */
+  clearExpiredOldKeys(): number {
+    const nowIso = new Date().toISOString();
+    const result = this.db.prepare(`
+      UPDATE identities
+      SET old_public_key_hash = NULL, old_key_expires_at = NULL
+      WHERE old_key_expires_at IS NOT NULL
+        AND old_key_expires_at < ?
+    `).run(nowIso);
+    return result.changes;
   }
 
   // ─── Org CRUD ───────────────────────────────────────────────────
@@ -598,6 +744,8 @@ export class IdentityDatabase {
   /**
    * Verify that a private key corresponds to a stored identity.
    * Returns the identity if the key matches, null otherwise.
+   *
+   * Also checks old keys within grace period.
    */
   verifyIdentity(privateKeyBase64: string): Identity | null {
     try {
@@ -616,9 +764,24 @@ export class IdentityDatabase {
         .update(publicKey)
         .digest('hex');
 
-      const row = this.db.prepare(
+      // Check current key
+      let row = this.db.prepare(
         'SELECT * FROM identities WHERE public_key_hash = ?'
       ).get(publicKeyHash) as Identity | undefined;
+
+      // Check old key within grace period
+      if (!row) {
+        row = this.db.prepare(
+          'SELECT * FROM identities WHERE old_public_key_hash = ? AND old_key_expires_at IS NOT NULL'
+        ).get(publicKeyHash) as Identity | undefined;
+
+        if (row && row.old_key_expires_at) {
+          const expiresAt = new Date(row.old_key_expires_at).getTime();
+          if (Date.now() > expiresAt) {
+            row = undefined; // Grace period expired
+          }
+        }
+      }
 
       // Zero out the secret key
       sodium.sodium_memzero(secretKey);

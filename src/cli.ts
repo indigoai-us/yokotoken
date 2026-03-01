@@ -1740,6 +1740,74 @@ identityCmd
     }
   });
 
+identityCmd
+  .command('rotate-key')
+  .description('Rotate an identity\'s Ed25519 keypair')
+  .requiredOption('--identity <name>', 'Identity name')
+  .option('--grace-period <duration>', 'Allow both old and new key for this duration (e.g., 1h, 30m)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { parseDuration } = await import('./vault.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        // Look up identity by name
+        const identity = idb.getIdentityByName(opts.identity);
+        if (!identity) {
+          process.stderr.write(`Error: Identity '${opts.identity}' not found\n`);
+          process.exit(1);
+        }
+
+        // Parse grace period if provided
+        let gracePeriodMs: number | undefined;
+        if (opts.gracePeriod) {
+          const parsed = parseDuration(opts.gracePeriod);
+          if (parsed === null) {
+            process.stderr.write(`Error: Invalid grace period format '${opts.gracePeriod}'. Use e.g., 1h, 30m, 1d\n`);
+            process.exit(1);
+          }
+          gracePeriodMs = parsed;
+        }
+
+        const result = idb.rotateKey(identity.id, gracePeriodMs);
+
+        // Audit: log key rotation
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('identity.key_rotated', {
+          ip: '127.0.0.1',
+          identity_id: identity.id,
+          identity_name: identity.name,
+          mode: 'local',
+          detail: `old_key_hash=${result.oldKeyHashPrefix}... new_key_hash=${result.newKeyHashPrefix}...${gracePeriodMs ? ` grace_period=${opts.gracePeriod}` : ''}`,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Key rotated for identity '${identity.name}':\n`);
+        process.stdout.write(`  Old key hash: ${result.oldKeyHashPrefix}...\n`);
+        process.stdout.write(`  New key hash: ${result.newKeyHashPrefix}...\n`);
+        if (gracePeriodMs) {
+          process.stdout.write(`  Grace period: ${opts.gracePeriod} (old key still valid until ${result.identity.old_key_expires_at})\n`);
+        } else {
+          process.stdout.write(`  Old key: immediately invalidated\n`);
+        }
+        process.stdout.write(`\n`);
+        process.stdout.write(`New private key (save this — it will NOT be shown again):\n`);
+        process.stdout.write(`  ${result.privateKey}\n`);
+        process.stdout.write(`\n`);
+        process.stdout.write(`New public key:\n`);
+        process.stdout.write(`  ${result.publicKey}\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
 // ─── org ─────────────────────────────────────────────────────────────
 const orgCmd = program
   .command('org')

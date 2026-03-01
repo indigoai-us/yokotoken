@@ -287,6 +287,23 @@ export class SessionStore {
   }
 
   /**
+   * Revoke all sessions belonging to a specific identity.
+   *
+   * Used during key rotation to invalidate sessions issued with the old key.
+   * Returns the number of sessions revoked.
+   */
+  revokeSessionsForIdentity(identityId: string): number {
+    let count = 0;
+    for (const [hash, session] of this.sessions) {
+      if (session.identity_id === identityId) {
+        this.sessions.delete(hash);
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
    * Remove expired sessions.
    */
   cleanup(): void {
@@ -445,7 +462,7 @@ export class NetworkAuthenticator {
       return { success: false, error: 'Identity not found' };
     }
 
-    // 3. Verify the public key matches the stored hash
+    // 3. Verify the public key matches the stored hash (or old key within grace period)
     let publicKey: Buffer;
     try {
       publicKey = Buffer.from(publicKeyBase64, 'base64');
@@ -462,7 +479,7 @@ export class NetworkAuthenticator {
       .update(publicKey)
       .digest('hex');
 
-    if (computedHash !== identity.public_key_hash) {
+    if (!this.identityDb.isValidKeyHash(identityId, computedHash)) {
       return { success: false, error: 'Public key does not match identity' };
     }
 

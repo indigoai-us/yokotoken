@@ -41,6 +41,8 @@ export type AuditOperation =
   | 'project.created'
   | 'membership.added'
   | 'membership.removed'
+  // Key rotation (US-010)
+  | 'identity.key_rotated'
   // Rotation / expiry auditing (US-009)
   | 'secret.get.expired'
   | 'secret.get.stale';
