@@ -2005,4 +2005,137 @@ authCmd
     }
   });
 
+// ─── access-requests ────────────────────────────────────────────────
+const accessRequestsCmd = program
+  .command('access-requests')
+  .description('Manage access requests (agent access request + human approval flow)');
+
+accessRequestsCmd
+  .command('list')
+  .description('List access requests')
+  .option('--org <org>', 'Filter by organization name')
+  .option('--status <status>', 'Filter by status: pending, approved, denied')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { AccessRequestManager } = await import('./access-requests.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const arm = new AccessRequestManager(idb);
+
+        // Clean expired requests first
+        arm.cleanExpired();
+
+        const filters: Record<string, string> = {};
+        if (opts.org) filters.org = opts.org;
+        if (opts.status) filters.status = opts.status;
+
+        const requests = arm.listRequests(filters);
+
+        if (requests.length === 0) {
+          process.stderr.write('No access requests found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(requests, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'REQUEST ID'.padEnd(34)} ${'ORG'.padEnd(16)} ${'PROJECT'.padEnd(16)} ${'ROLE'.padEnd(10)} ${'STATUS'.padEnd(10)} JUSTIFICATION\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(16)} ${'─'.repeat(16)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(30)}\n`,
+          );
+          for (const r of requests) {
+            const proj = r.project || '-';
+            const justTrunc = r.justification.length > 30 ? r.justification.slice(0, 27) + '...' : r.justification;
+            process.stdout.write(
+              `${r.request_id.padEnd(34)} ${r.org.padEnd(16)} ${proj.padEnd(16)} ${r.role_requested.padEnd(10)} ${r.status.padEnd(10)} ${justTrunc}\n`,
+            );
+          }
+          process.stderr.write(`\n${requests.length} access request(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+accessRequestsCmd
+  .command('approve <requestId>')
+  .description('Approve an access request (creates membership automatically)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (requestId: string, opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { AccessRequestManager } = await import('./access-requests.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const arm = new AccessRequestManager(idb);
+        const result = arm.approveRequest(requestId, 'cli-admin');
+
+        process.stdout.write(`Access request approved:\n`);
+        process.stdout.write(`  Request ID: ${result.request_id}\n`);
+        process.stdout.write(`  Identity:   ${result.identity_id}\n`);
+        process.stdout.write(`  Org:        ${result.org}\n`);
+        if (result.project) {
+          process.stdout.write(`  Project:    ${result.project}\n`);
+        }
+        process.stdout.write(`  Role:       ${result.role_requested}\n`);
+        process.stdout.write(`  Status:     ${result.status}\n`);
+        process.stdout.write(`Membership created successfully.\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+accessRequestsCmd
+  .command('deny <requestId>')
+  .description('Deny an access request')
+  .option('--reason <reason>', 'Denial reason (visible to the requesting agent)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (requestId: string, opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { AccessRequestManager } = await import('./access-requests.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = new IdentityDatabase(dbPath);
+
+      try {
+        const arm = new AccessRequestManager(idb);
+        const result = arm.denyRequest(requestId, 'cli-admin', opts.reason);
+
+        process.stdout.write(`Access request denied:\n`);
+        process.stdout.write(`  Request ID: ${result.request_id}\n`);
+        process.stdout.write(`  Identity:   ${result.identity_id}\n`);
+        process.stdout.write(`  Org:        ${result.org}\n`);
+        if (result.project) {
+          process.stdout.write(`  Project:    ${result.project}\n`);
+        }
+        process.stdout.write(`  Status:     ${result.status}\n`);
+        if (result.denial_reason) {
+          process.stdout.write(`  Reason:     ${result.denial_reason}\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
 program.parse();

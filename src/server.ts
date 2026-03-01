@@ -35,6 +35,7 @@ import { AuditLogger } from './audit.js';
 import { IdentityDatabase, getDefaultIdentityDbPath } from './identity.js';
 import { parseScope, checkAccess, filterAccessiblePaths } from './scoping.js';
 import { NetworkAuthenticator } from './network-auth.js';
+import { AccessRequestManager } from './access-requests.js';
 
 export interface ServerConfig {
   vaultPath: string;
@@ -115,6 +116,8 @@ interface ServerState {
   identityDb: IdentityDatabase | null;
   /** Network authenticator for challenge-response auth (US-003). */
   networkAuth: NetworkAuthenticator | null;
+  /** Access request manager (US-004). */
+  accessRequestManager: AccessRequestManager | null;
 }
 
 /**
@@ -309,6 +312,98 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to verify challenge';
+        sendJson(res, 500, { error: message });
+      }
+      return;
+    }
+
+    // ── Access request endpoints (unauthenticated — agents use these before having access) ──
+
+    // POST /v1/access-requests — Submit an access request
+    if (req.method === 'POST' && pathname0 === '/v1/access-requests') {
+      if (!state.accessRequestManager) {
+        sendJson(res, 501, { error: 'Access requests are not configured (no identity database)' });
+        return;
+      }
+
+      try {
+        const body = await parseBody(req);
+        const identityId = body.identity_id as string | undefined;
+        const org = body.org as string | undefined;
+        const project = body.project as string | undefined;
+        const roleRequested = body.role_requested as string | undefined;
+        const justification = body.justification as string | undefined;
+
+        if (!identityId || typeof identityId !== 'string') {
+          sendJson(res, 400, { error: 'identity_id is required' });
+          return;
+        }
+        if (!org || typeof org !== 'string') {
+          sendJson(res, 400, { error: 'org is required' });
+          return;
+        }
+        if (!roleRequested || typeof roleRequested !== 'string') {
+          sendJson(res, 400, { error: 'role_requested is required' });
+          return;
+        }
+        if (!justification || typeof justification !== 'string') {
+          sendJson(res, 400, { error: 'justification is required' });
+          return;
+        }
+
+        const request = state.accessRequestManager.createRequest({
+          identity_id: identityId,
+          org,
+          project: project || null,
+          role_requested: roleRequested as 'admin' | 'member' | 'readonly',
+          justification,
+        });
+
+        sendJson(res, 201, {
+          request_id: request.request_id,
+          status: request.status,
+          created_at: request.created_at,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to create access request';
+        sendJson(res, 400, { error: message });
+      }
+      return;
+    }
+
+    // GET /v1/access-requests/:id — Poll access request status
+    if (req.method === 'GET' && pathname0.startsWith('/v1/access-requests/')) {
+      if (!state.accessRequestManager) {
+        sendJson(res, 501, { error: 'Access requests are not configured (no identity database)' });
+        return;
+      }
+
+      try {
+        const requestId = decodeURIComponent(pathname0.slice('/v1/access-requests/'.length));
+        if (!requestId) {
+          sendJson(res, 400, { error: 'Request ID is required' });
+          return;
+        }
+
+        const request = state.accessRequestManager.getRequest(requestId);
+        if (!request) {
+          sendJson(res, 404, { error: `Access request '${requestId}' not found` });
+          return;
+        }
+
+        // Check and update expiry status
+        if (request.status === 'pending' && state.accessRequestManager.isExpired(request)) {
+          state.accessRequestManager.cleanExpired();
+          const updated = state.accessRequestManager.getRequest(requestId);
+          if (updated) {
+            sendJson(res, 200, updated);
+            return;
+          }
+        }
+
+        sendJson(res, 200, request);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to get access request';
         sendJson(res, 500, { error: message });
       }
       return;
@@ -849,6 +944,12 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
     );
   }
 
+  // Initialize access request manager if identity DB is available (US-004).
+  let accessRequestManager: AccessRequestManager | null = null;
+  if (identityDb) {
+    accessRequestManager = new AccessRequestManager(identityDb);
+  }
+
   const state: ServerState = {
     vault: new VaultEngine(config.vaultPath),
     idleTimer: null,
@@ -862,6 +963,7 @@ export function createVaultServer(config: ServerConfig): Promise<https.Server | 
     auditLogger,
     identityDb,
     networkAuth,
+    accessRequestManager,
   };
 
   const handler = createRequestHandler(config, state);
