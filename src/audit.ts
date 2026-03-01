@@ -40,7 +40,10 @@ export type AuditOperation =
   | 'org.created'
   | 'project.created'
   | 'membership.added'
-  | 'membership.removed';
+  | 'membership.removed'
+  // Rotation / expiry auditing (US-009)
+  | 'secret.get.expired'
+  | 'secret.get.stale';
 
 export interface AuditEntry {
   /** ISO 8601 timestamp. */

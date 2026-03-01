@@ -442,6 +442,8 @@ program
   .option('--description <desc>', 'Human-readable description of the secret')
   .option('--org <org>', 'Organization scope for the secret')
   .option('--project <project>', 'Project scope for the secret (requires --org)')
+  .option('--expires <date>', 'Expiry date in ISO 8601 format (e.g., 2026-06-01)')
+  .option('--rotation-interval <duration>', 'Rotation reminder interval (e.g., 30d, 90d, 1w)')
   .action(async (secretPath: string, opts) => {
     try {
       const port = ensureServerRunning();
@@ -479,6 +481,8 @@ program
       const body: Record<string, unknown> = { value };
       if (opts.type) body.type = opts.type;
       if (opts.description) body.description = opts.description;
+      if (opts.expires) body.expires_at = opts.expires;
+      if (opts.rotationInterval) body.rotation_interval = opts.rotationInterval;
 
       const res = await request(
         { port, host: '127.0.0.1', token },
@@ -620,6 +624,87 @@ program
 
       if (res.statusCode === 200) {
         process.stderr.write(`Deleted: ${secretPath}\n`);
+      } else {
+        process.stderr.write(`Error: ${res.body.error}\n`);
+        process.exit(1);
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── secrets (rotation / expiry subcommands, US-009) ──────────────
+const secretsCmd = program
+  .command('secrets')
+  .description('Rotation and expiry management');
+
+secretsCmd
+  .command('expiring')
+  .description('List secrets expiring within a time window')
+  .option('--within <duration>', 'Time window (e.g., 7d, 24h, 1w)', '7d')
+  .action(async (opts) => {
+    try {
+      const port = ensureServerRunning();
+      const token = getServerToken();
+
+      const res = await request(
+        { port, host: '127.0.0.1', token },
+        'GET',
+        `/v1/secrets/expiring?within=${encodeURIComponent(opts.within)}`,
+      );
+
+      if (res.statusCode === 200) {
+        const entries = res.body.entries as Array<Record<string, unknown>>;
+        if (entries.length === 0) {
+          process.stderr.write(`No secrets expiring within ${opts.within}\n`);
+          return;
+        }
+        process.stderr.write(`Secrets expiring within ${opts.within}:\n\n`);
+        for (const entry of entries) {
+          const expiredTag = entry.expired ? ' [EXPIRED]' : '';
+          process.stderr.write(`  ${entry.path}${expiredTag}\n`);
+          process.stderr.write(`    expires_at: ${(entry.metadata as Record<string, unknown>)?.expires_at ?? 'N/A'}\n`);
+        }
+        process.stderr.write(`\n${entries.length} secret(s) found.\n`);
+      } else {
+        process.stderr.write(`Error: ${res.body.error}\n`);
+        process.exit(1);
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+secretsCmd
+  .command('stale')
+  .description('List secrets past their rotation interval')
+  .action(async () => {
+    try {
+      const port = ensureServerRunning();
+      const token = getServerToken();
+
+      const res = await request(
+        { port, host: '127.0.0.1', token },
+        'GET',
+        '/v1/secrets/stale',
+      );
+
+      if (res.statusCode === 200) {
+        const entries = res.body.entries as Array<Record<string, unknown>>;
+        if (entries.length === 0) {
+          process.stderr.write('No stale secrets found.\n');
+          return;
+        }
+        process.stderr.write('Stale secrets (past rotation interval):\n\n');
+        for (const entry of entries) {
+          const meta = entry.metadata as Record<string, unknown>;
+          process.stderr.write(`  ${entry.path}\n`);
+          process.stderr.write(`    rotation_interval: ${meta?.rotation_interval ?? 'N/A'}\n`);
+          process.stderr.write(`    last_rotated_at: ${meta?.last_rotated_at ?? entry.createdAt ?? 'N/A'}\n`);
+        }
+        process.stderr.write(`\n${entries.length} stale secret(s) found.\n`);
       } else {
         process.stderr.write(`Error: ${res.body.error}\n`);
         process.exit(1);

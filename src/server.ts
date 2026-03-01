@@ -690,6 +690,8 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         const metadata: Record<string, string | undefined> = {};
         if (body.type && typeof body.type === 'string') metadata.type = body.type;
         if (body.description && typeof body.description === 'string') metadata.description = body.description;
+        if (body.expires_at && typeof body.expires_at === 'string') metadata.expires_at = body.expires_at;
+        if (body.rotation_interval && typeof body.rotation_interval === 'string') metadata.rotation_interval = body.rotation_interval;
 
         try {
           state.vault.store(secretPath, value, metadata);
@@ -760,6 +762,67 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
         return;
       }
 
+      // GET /v1/secrets/expiring?within=7d — List expiring secrets (US-009)
+      if (req.method === 'GET' && pathname === '/v1/secrets/expiring') {
+        if (!state.vault.isUnlocked) {
+          sendJson(res, 403, { error: 'Vault is locked. Unlock it first.' });
+          return;
+        }
+
+        const url3 = new URL(req.url || '/', `https://localhost:${config.port}`);
+        const withinStr = url3.searchParams.get('within') || '7d';
+        const { parseDuration } = await import('./vault.js');
+        const withinMs = parseDuration(withinStr);
+        if (!withinMs) {
+          sendJson(res, 400, { error: `Invalid duration: ${withinStr}. Use e.g. 7d, 24h, 1w` });
+          return;
+        }
+
+        try {
+          const entries = state.vault.expiringSecrets(withinMs);
+          resetIdleTimer(state);
+          state.auditLogger.logAccess('secret.list', {
+            tokenName: authenticatedTokenName,
+            ip: clientIp,
+            detail: `expiring within=${withinStr}`,
+            identity_id: authenticatedIdentityId,
+            identity_name: authenticatedIdentityId ? state.identityDb?.getIdentity(authenticatedIdentityId)?.name : null,
+            mode: state.networkMode ? 'network' : 'local',
+          });
+          sendJson(res, 200, { entries });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to list expiring secrets';
+          sendJson(res, 500, { error: message });
+        }
+        return;
+      }
+
+      // GET /v1/secrets/stale — List stale secrets (US-009)
+      if (req.method === 'GET' && pathname === '/v1/secrets/stale') {
+        if (!state.vault.isUnlocked) {
+          sendJson(res, 403, { error: 'Vault is locked. Unlock it first.' });
+          return;
+        }
+
+        try {
+          const entries = state.vault.staleSecrets();
+          resetIdleTimer(state);
+          state.auditLogger.logAccess('secret.list', {
+            tokenName: authenticatedTokenName,
+            ip: clientIp,
+            detail: 'stale secrets',
+            identity_id: authenticatedIdentityId,
+            identity_name: authenticatedIdentityId ? state.identityDb?.getIdentity(authenticatedIdentityId)?.name : null,
+            mode: state.networkMode ? 'network' : 'local',
+          });
+          sendJson(res, 200, { entries });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Failed to list stale secrets';
+          sendJson(res, 500, { error: message });
+        }
+        return;
+      }
+
       // GET /v1/secrets/:path — Get a decrypted secret
       if (req.method === 'GET' && pathname.startsWith('/v1/secrets/')) {
         const secretPath = decodeURIComponent(pathname.slice('/v1/secrets/'.length));
@@ -795,20 +858,39 @@ function createRequestHandler(config: ServerConfig, state: ServerState) {
             return;
           }
           // Audit: log get operation (never log the secret value)
-          state.auditLogger.logAccess('secret.get', {
+          // Tag expired/stale accesses for audit visibility (US-009)
+          const auditFields = {
             tokenName: authenticatedTokenName,
             secretPath,
             ip: clientIp,
             identity_id: authenticatedIdentityId,
             identity_name: authenticatedIdentityId ? state.identityDb?.getIdentity(authenticatedIdentityId)?.name : null,
-            mode: state.networkMode ? 'network' : 'local',
-          });
+            mode: (state.networkMode ? 'network' : 'local') as 'local' | 'network',
+          };
+
+          state.auditLogger.logAccess('secret.get', auditFields);
+
+          if (entry.expired) {
+            state.auditLogger.logAccess('secret.get.expired', {
+              ...auditFields,
+              detail: `expired at ${entry.metadata.expires_at}`,
+            });
+          }
+          if (entry.stale) {
+            state.auditLogger.logAccess('secret.get.stale', {
+              ...auditFields,
+              detail: `rotation_interval=${entry.metadata.rotation_interval}, last_rotated_at=${entry.metadata.last_rotated_at || entry.createdAt}`,
+            });
+          }
+
           sendJson(res, 200, {
             path: entry.path,
             value: entry.value,
             metadata: entry.metadata,
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
+            expired: entry.expired ?? false,
+            stale: entry.stale ?? false,
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : 'Failed to get secret';

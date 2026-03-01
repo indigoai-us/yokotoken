@@ -11,7 +11,7 @@
  * XChaCha20-Poly1305 before touching the database.
  */
 
-import { VaultDatabase } from './db.js';
+import { VaultDatabase, type SecretRow } from './db.js';
 import {
   deriveMasterKey,
   encrypt,
@@ -21,9 +21,69 @@ import {
   SALT_BYTES,
 } from './crypto.js';
 
+// ─── Duration parsing helpers (US-009) ────────────────────────────
+
+/**
+ * Parse a human-friendly duration string into milliseconds.
+ * Supports: '30d', '90d', '24h', '1w', '7d', etc.
+ * Returns null if the format is not recognized.
+ */
+export function parseDuration(input: string): number | null {
+  const match = input.trim().match(/^(\d+)\s*(d|h|w|m|s)$/i);
+  if (!match) return null;
+
+  const value = parseInt(match[1], 10);
+  const unit = match[2].toLowerCase();
+
+  switch (unit) {
+    case 's': return value * 1000;
+    case 'm': return value * 60 * 1000;
+    case 'h': return value * 60 * 60 * 1000;
+    case 'd': return value * 24 * 60 * 60 * 1000;
+    case 'w': return value * 7 * 24 * 60 * 60 * 1000;
+    default: return null;
+  }
+}
+
+/**
+ * Parse a datetime string as UTC. SQLite's datetime('now') produces
+ * strings like '2026-03-01 08:53:26' without a timezone suffix.
+ * JavaScript's Date() parses these as local time, so we append 'Z'
+ * when needed to ensure UTC interpretation.
+ */
+function parseUtcDate(dateStr: string): number {
+  // If it already has a timezone indicator (Z, +, -), parse as-is
+  if (dateStr.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(dateStr) || dateStr.includes('T')) {
+    return new Date(dateStr).getTime();
+  }
+  // SQLite format: '2026-03-01 08:53:26' — treat as UTC
+  return new Date(dateStr + 'Z').getTime();
+}
+
+/**
+ * Determine if a secret row is "stale" — past its rotation interval.
+ *
+ * Stale means: (last_rotated_at || created_at) + rotation_interval < now
+ */
+function isStale(row: SecretRow, nowMs: number): boolean {
+  if (!row.rotation_interval) return false;
+
+  const intervalMs = parseDuration(row.rotation_interval);
+  if (!intervalMs) return false;
+
+  const baseTime = row.last_rotated_at
+    ? parseUtcDate(row.last_rotated_at)
+    : parseUtcDate(row.created_at);
+
+  return (baseTime + intervalMs) < nowMs;
+}
+
 export interface SecretMetadata {
   type?: string;
   description?: string;
+  expires_at?: string;
+  rotation_interval?: string;
+  last_rotated_at?: string;
 }
 
 export interface SecretEntry {
@@ -32,6 +92,10 @@ export interface SecretEntry {
   metadata: SecretMetadata;
   createdAt: string;
   updatedAt: string;
+  /** True if the secret is past its expires_at date (advisory, not enforcement). */
+  expired?: boolean;
+  /** True if the secret is past its rotation interval. */
+  stale?: boolean;
 }
 
 export interface SecretListEntry {
@@ -39,6 +103,8 @@ export interface SecretListEntry {
   metadata: SecretMetadata;
   createdAt: string;
   updatedAt: string;
+  expired?: boolean;
+  stale?: boolean;
 }
 
 export interface VaultStatus {
@@ -192,6 +258,11 @@ export class VaultEngine {
       nonce,
       metadata?.type,
       metadata?.description,
+      {
+        expires_at: metadata?.expires_at ?? null,
+        rotation_interval: metadata?.rotation_interval ?? null,
+        last_rotated_at: metadata?.last_rotated_at ?? null,
+      },
     );
   }
 
@@ -200,6 +271,8 @@ export class VaultEngine {
    *
    * Returns null if no secret exists at the path.
    * Throws if decryption fails (should not happen with correct key).
+   *
+   * Includes `expired` and `stale` advisory flags (US-009).
    */
   get(secretPath: string): SecretEntry | null {
     const key = this.requireUnlocked();
@@ -212,15 +285,24 @@ export class VaultEngine {
 
     const decrypted = decrypt(row.encrypted_value, row.nonce, key);
 
+    const now = Date.now();
+    const expired = row.expires_at ? parseUtcDate(row.expires_at) < now : false;
+    const stale = isStale(row, now);
+
     return {
       path: row.path,
       value: decrypted.toString('utf-8'),
       metadata: {
         type: row.secret_type ?? undefined,
         description: row.description ?? undefined,
+        expires_at: row.expires_at ?? undefined,
+        rotation_interval: row.rotation_interval ?? undefined,
+        last_rotated_at: row.last_rotated_at ?? undefined,
       },
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+      expired,
+      stale,
     };
   }
 
@@ -232,6 +314,7 @@ export class VaultEngine {
   list(prefix?: string): SecretListEntry[] {
     this.requireUnlocked();
 
+    const now = Date.now();
     const rows = this.db.listSecrets(prefix);
     return rows
       .filter(row => row.path !== '__vault_verify__')
@@ -240,9 +323,14 @@ export class VaultEngine {
         metadata: {
           type: row.secret_type ?? undefined,
           description: row.description ?? undefined,
+          expires_at: row.expires_at ?? undefined,
+          rotation_interval: row.rotation_interval ?? undefined,
+          last_rotated_at: row.last_rotated_at ?? undefined,
         },
         createdAt: row.created_at,
         updatedAt: row.updated_at,
+        expired: row.expires_at ? parseUtcDate(row.expires_at) < now : false,
+        stale: isStale(row, now),
       }));
   }
 
@@ -277,6 +365,67 @@ export class VaultEngine {
       secretCount: userSecretCount,
       vaultPath: this.vaultPath,
     };
+  }
+
+  // ─── Rotation / Expiry queries (US-009) ─────────────────────────
+
+  /**
+   * List secrets expiring within the given time window.
+   *
+   * @param withinMs - Time window in milliseconds from now (default: 7 days)
+   * @returns Secrets with expires_at within the window (including already expired)
+   */
+  expiringSecrets(withinMs: number = 7 * 24 * 60 * 60 * 1000): SecretListEntry[] {
+    this.requireUnlocked();
+
+    const deadline = new Date(Date.now() + withinMs).toISOString();
+    const now = Date.now();
+    const rows = this.db.listExpiringSecrets(deadline);
+
+    return rows.map(row => ({
+      path: row.path,
+      metadata: {
+        type: row.secret_type ?? undefined,
+        description: row.description ?? undefined,
+        expires_at: row.expires_at ?? undefined,
+        rotation_interval: row.rotation_interval ?? undefined,
+        last_rotated_at: row.last_rotated_at ?? undefined,
+      },
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      expired: row.expires_at ? parseUtcDate(row.expires_at) < now : false,
+      stale: isStale(row, now),
+    }));
+  }
+
+  /**
+   * List secrets that are past their rotation interval (stale).
+   *
+   * A secret is stale when:
+   *   (last_rotated_at || created_at) + rotation_interval < now
+   */
+  staleSecrets(): SecretListEntry[] {
+    this.requireUnlocked();
+
+    const now = Date.now();
+    const rows = this.db.listSecretsWithRotationInterval();
+
+    return rows
+      .filter(row => isStale(row, now))
+      .map(row => ({
+        path: row.path,
+        metadata: {
+          type: row.secret_type ?? undefined,
+          description: row.description ?? undefined,
+          expires_at: row.expires_at ?? undefined,
+          rotation_interval: row.rotation_interval ?? undefined,
+          last_rotated_at: row.last_rotated_at ?? undefined,
+        },
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        expired: row.expires_at ? parseUtcDate(row.expires_at) < now : false,
+        stale: true,
+      }));
   }
 
   /**

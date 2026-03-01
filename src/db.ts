@@ -22,6 +22,9 @@ export interface SecretRow {
   description: string | null;
   created_at: string;
   updated_at: string;
+  expires_at: string | null;
+  rotation_interval: string | null;
+  last_rotated_at: string | null;
 }
 
 export interface TokenRow {
@@ -100,6 +103,29 @@ export class VaultDatabase {
       CREATE INDEX IF NOT EXISTS idx_token_store_name ON token_store(name);
       CREATE INDEX IF NOT EXISTS idx_token_store_hash ON token_store(token_hash);
     `);
+
+    // ── Migration: add rotation/expiry columns (US-009) ───────────────
+    this.migrateRotationColumns();
+  }
+
+  /**
+   * Add expires_at, rotation_interval, last_rotated_at columns to secrets
+   * table if they don't already exist. Uses ALTER TABLE for forward compat.
+   */
+  private migrateRotationColumns(): void {
+    // Check if columns already exist by inspecting table_info
+    const columns = this.db.pragma('table_info(secrets)') as Array<{ name: string }>;
+    const colNames = new Set(columns.map(c => c.name));
+
+    if (!colNames.has('expires_at')) {
+      this.db.exec('ALTER TABLE secrets ADD COLUMN expires_at TEXT');
+    }
+    if (!colNames.has('rotation_interval')) {
+      this.db.exec('ALTER TABLE secrets ADD COLUMN rotation_interval TEXT');
+    }
+    if (!colNames.has('last_rotated_at')) {
+      this.db.exec('ALTER TABLE secrets ADD COLUMN last_rotated_at TEXT');
+    }
   }
 
   /**
@@ -132,6 +158,11 @@ export class VaultDatabase {
     nonce: Buffer,
     secretType?: string,
     description?: string,
+    rotation?: {
+      expires_at?: string | null;
+      rotation_interval?: string | null;
+      last_rotated_at?: string | null;
+    },
   ): void {
     this.db.prepare(`
       INSERT INTO vault_meta (key, value) VALUES ('_noop', X'00')
@@ -146,14 +177,35 @@ export class VaultDatabase {
             nonce = ?,
             secret_type = COALESCE(?, secret_type),
             description = COALESCE(?, description),
+            expires_at = COALESCE(?, expires_at),
+            rotation_interval = COALESCE(?, rotation_interval),
+            last_rotated_at = COALESCE(?, last_rotated_at),
             updated_at = datetime('now')
         WHERE path = ?
-      `).run(encryptedValue, nonce, secretType ?? null, description ?? null, secretPath);
+      `).run(
+        encryptedValue,
+        nonce,
+        secretType ?? null,
+        description ?? null,
+        rotation?.expires_at ?? null,
+        rotation?.rotation_interval ?? null,
+        rotation?.last_rotated_at ?? null,
+        secretPath,
+      );
     } else {
       this.db.prepare(`
-        INSERT INTO secrets (path, encrypted_value, nonce, secret_type, description)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(secretPath, encryptedValue, nonce, secretType ?? null, description ?? null);
+        INSERT INTO secrets (path, encrypted_value, nonce, secret_type, description, expires_at, rotation_interval, last_rotated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        secretPath,
+        encryptedValue,
+        nonce,
+        secretType ?? null,
+        description ?? null,
+        rotation?.expires_at ?? null,
+        rotation?.rotation_interval ?? null,
+        rotation?.last_rotated_at ?? null,
+      );
     }
 
     // Clean up no-op meta entry
@@ -293,6 +345,76 @@ export class VaultDatabase {
       'SELECT COUNT(*) as count FROM token_store'
     ).get() as { count: number };
     return row.count;
+  }
+
+  // ─── Rotation / Expiry queries (US-009) ─────────────────────────
+
+  /**
+   * List secrets that expire before the given ISO 8601 deadline.
+   * Only returns rows where expires_at is non-null.
+   */
+  listExpiringSecrets(beforeIso: string): SecretRow[] {
+    return this.db.prepare(
+      `SELECT * FROM secrets
+       WHERE expires_at IS NOT NULL
+         AND expires_at <= ?
+         AND path != '__vault_verify__'
+       ORDER BY expires_at ASC`
+    ).all(beforeIso) as SecretRow[];
+  }
+
+  /**
+   * List secrets that are past their rotation interval.
+   * A secret is "stale" when:
+   *   (last_rotated_at OR created_at) + rotation_interval < now
+   *
+   * Since SQLite cannot natively add arbitrary durations, we return all
+   * secrets with a rotation_interval and let the caller do the math.
+   */
+  listSecretsWithRotationInterval(): SecretRow[] {
+    return this.db.prepare(
+      `SELECT * FROM secrets
+       WHERE rotation_interval IS NOT NULL
+         AND path != '__vault_verify__'
+       ORDER BY path ASC`
+    ).all() as SecretRow[];
+  }
+
+  /**
+   * Update rotation metadata for a secret (e.g., after rotation).
+   */
+  updateRotationFields(
+    secretPath: string,
+    fields: {
+      expires_at?: string | null;
+      rotation_interval?: string | null;
+      last_rotated_at?: string | null;
+    },
+  ): void {
+    const sets: string[] = [];
+    const params: (string | null)[] = [];
+
+    if (fields.expires_at !== undefined) {
+      sets.push('expires_at = ?');
+      params.push(fields.expires_at);
+    }
+    if (fields.rotation_interval !== undefined) {
+      sets.push('rotation_interval = ?');
+      params.push(fields.rotation_interval);
+    }
+    if (fields.last_rotated_at !== undefined) {
+      sets.push('last_rotated_at = ?');
+      params.push(fields.last_rotated_at);
+    }
+
+    if (sets.length === 0) return;
+
+    sets.push("updated_at = datetime('now')");
+    params.push(secretPath);
+
+    this.db.prepare(
+      `UPDATE secrets SET ${sets.join(', ')} WHERE path = ?`
+    ).run(...params);
   }
 
   /**
