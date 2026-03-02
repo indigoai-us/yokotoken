@@ -67,8 +67,6 @@ jobs:
 
       - name: Publish to npm
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # Job 3: Create GitHub Release with auto-generated notes
   github-release:
