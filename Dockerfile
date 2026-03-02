@@ -11,8 +11,10 @@ RUN apt-get update && \
 
 WORKDIR /build
 
-# Copy package files first for layer caching
+# Copy package files and postinstall script for layer caching
+# scripts/ must be present before npm ci — the postinstall hook runs during install
 COPY package.json package-lock.json ./
+COPY scripts/ ./scripts/
 
 # Install all dependencies (including devDependencies for TypeScript build)
 RUN npm ci
