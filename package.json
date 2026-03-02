@@ -8,20 +8,62 @@
   "bin": {
     "hq-vault": "dist/cli.js"
   },
+  "files": [
+    "dist/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./sdk": {
+      "types": "./dist/sdk.d.ts",
+      "import": "./dist/sdk.js"
+    },
+    "./client": {
+      "types": "./dist/network-client.d.ts",
+      "import": "./dist/network-client.js"
+    }
+  },
   "scripts": {
     "postinstall": "node scripts/fix-libsodium-esm.js",
+    "prepublishOnly": "npm run typecheck && npm run build && npm test",
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/indigoai-us/hq-vault.git"
+  },
+  "homepage": "https://hq-vault-docs.vercel.app",
+  "bugs": {
+    "url": "https://github.com/indigoai-us/hq-vault/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "vault",
+    "secrets",
+    "encryption",
+    "credentials",
+    "libsodium",
+    "agent",
+    "ai",
+    "cli",
+    "security"
+  ],
+  "author": "Indigo AI <engineering@getindigo.ai> (https://getindigo.ai)",
   "dependencies": {
-    "@types/commander": "^2.12.0",
     "commander": "^14.0.3",
     "libsodium-wrappers-sumo": "^0.7.15",
     "sql.js": "^1.12.0"
   },
   "devDependencies": {
+    "@types/commander": "^2.12.0",
     "@types/libsodium-wrappers-sumo": "^0.7.8",
     "@types/node": "^22.13.4",
     "@types/sql.js": "^1.4.9",
