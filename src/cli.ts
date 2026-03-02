@@ -27,6 +27,7 @@ import { getDefaultTokenFile, readTokenFile } from './auth.js';
 import { startWebEntry } from './web-entry.js';
 import { startDaemon, stopDaemon, restartDaemon, getDefaultLogFile } from './daemon.js';
 import {
+  AuditLogger,
   readAuditLog,
   tailAuditLog,
   getDefaultAuditLogPath,
@@ -41,6 +42,15 @@ import {
   envNameToPath,
   detectImportDuplicates,
 } from './backup.js';
+import {
+  readConfig,
+  writeConfig,
+  setConfigField,
+  resolveFieldName,
+  formatConfigForDisplay,
+  getDefaultConfigPath,
+  getValidFields,
+} from './config.js';
 import fs from 'node:fs';
 
 const program = new Command();
@@ -137,9 +147,9 @@ program
           if (fs.existsSync(shmPath)) fs.unlinkSync(shmPath);
         }
 
-        const vault = new VaultEngine(vaultPath);
-        vault.init(passphrase);
-        vault.close();
+        const vault = await VaultEngine.open(vaultPath);
+        await vault.init(passphrase);
+        await vault.close();
 
         process.stderr.write(`Vault initialized at ${vaultPath}\n`);
         process.stderr.write('Start the vault server with: hq-vault serve\n');
@@ -159,6 +169,10 @@ program
   .option('--vault-path <path>', 'Path to vault database', getDefaultVaultPath())
   .option('--idle-timeout <minutes>', 'Auto-lock after N minutes of inactivity (0 to disable)', '30')
   .option('--insecure', 'Use plain HTTP instead of HTTPS (NOT recommended)')
+  .option('--network', 'Enable network mode: bind to 0.0.0.0, require TLS and identity auth')
+  .option('--bind <address>', 'Custom bind address (default: 127.0.0.1 for local, 0.0.0.0 for network)')
+  .option('--tls-cert <path>', 'Path to TLS certificate file (PEM)')
+  .option('--tls-key <path>', 'Path to TLS private key file (PEM)')
   .option('--daemon', 'Run the server as a background daemon process')
   .option('--stop', 'Stop a running daemon')
   .option('--restart', 'Restart the daemon')
@@ -231,6 +245,29 @@ program
       const idleTimeoutMs = idleTimeoutMinutes * 60 * 1000;
       const pidFile = getDefaultPidFile();
       const portFile = getDefaultPortFile();
+      const isNetwork = opts.network || false;
+
+      // ── Network mode CLI validations ─────────────────────────
+      if (isNetwork && opts.insecure) {
+        process.stderr.write('Error: Cannot use --insecure with --network. Network mode requires TLS.\n');
+        process.exit(1);
+      }
+
+      // Validate --tls-cert and --tls-key are provided together
+      if ((opts.tlsCert && !opts.tlsKey) || (!opts.tlsCert && opts.tlsKey)) {
+        process.stderr.write('Error: --tls-cert and --tls-key must be provided together.\n');
+        process.exit(1);
+      }
+
+      // Validate cert/key files exist
+      if (opts.tlsCert && !fs.existsSync(opts.tlsCert)) {
+        process.stderr.write(`Error: TLS certificate file not found: ${opts.tlsCert}\n`);
+        process.exit(1);
+      }
+      if (opts.tlsKey && !fs.existsSync(opts.tlsKey)) {
+        process.stderr.write(`Error: TLS key file not found: ${opts.tlsKey}\n`);
+        process.exit(1);
+      }
 
       // Check if server is already running
       const { running, pid } = isServerRunning(pidFile);
@@ -255,13 +292,21 @@ program
         pidFile,
         portFile,
         insecure: opts.insecure || false,
+        network: isNetwork,
+        bindAddress: opts.bind || undefined,
+        tlsCertFile: opts.tlsCert || undefined,
+        tlsKeyFile: opts.tlsKey || undefined,
       });
 
       const addr = server.address();
       const boundPort = typeof addr === 'object' && addr ? addr.port : port;
       const protocol = opts.insecure ? 'http' : 'https';
+      const bindAddr = opts.bind || (isNetwork ? '0.0.0.0' : '127.0.0.1');
 
-      process.stderr.write(`hq-vault server listening on ${protocol}://127.0.0.1:${boundPort}\n`);
+      process.stderr.write(`hq-vault server listening on ${protocol}://${bindAddr}:${boundPort}\n`);
+      if (isNetwork) {
+        process.stderr.write('Mode: NETWORK (identity-based auth only, bootstrap token disabled)\n');
+      }
       process.stderr.write(`Vault path: ${vaultPath}\n`);
       if (idleTimeoutMinutes > 0) {
         process.stderr.write(`Auto-lock: ${idleTimeoutMinutes} minutes\n`);
@@ -391,15 +436,35 @@ program
 // ─── store ─────────────────────────────────────────────────────────
 program
   .command('store <path>')
-  .description('Store a secret at the given path')
+  .description('Store a secret at the given path (use --org/--project for scoped secrets)')
   .option('--file <filepath>', 'Read secret value from a file instead of stdin')
   .option('--type <type>', 'Secret type (oauth-token, api-key, password, certificate, other)')
   .option('--description <desc>', 'Human-readable description of the secret')
+  .option('--org <org>', 'Organization scope for the secret')
+  .option('--project <project>', 'Project scope for the secret (requires --org)')
+  .option('--expires <date>', 'Expiry date in ISO 8601 format (e.g., 2026-06-01)')
+  .option('--rotation-interval <duration>', 'Rotation reminder interval (e.g., 30d, 90d, 1w)')
   .action(async (secretPath: string, opts) => {
     try {
       const port = ensureServerRunning();
       const token = getServerToken();
       let value: string;
+
+      // Validate --project requires --org
+      if (opts.project && !opts.org) {
+        process.stderr.write('Error: --project requires --org to be specified\n');
+        process.exit(1);
+      }
+
+      // Build the scoped path if --org is provided
+      let finalPath = secretPath;
+      if (opts.org) {
+        if (opts.project) {
+          finalPath = `org/${opts.org}/project/${opts.project}/${secretPath}`;
+        } else {
+          finalPath = `org/${opts.org}/${secretPath}`;
+        }
+      }
 
       if (opts.file) {
         // Read secret value from file
@@ -416,17 +481,19 @@ program
       const body: Record<string, unknown> = { value };
       if (opts.type) body.type = opts.type;
       if (opts.description) body.description = opts.description;
+      if (opts.expires) body.expires_at = opts.expires;
+      if (opts.rotationInterval) body.rotation_interval = opts.rotationInterval;
 
       const res = await request(
         { port, host: '127.0.0.1', token },
         'PUT',
-        `/v1/secrets/${encodeURIComponent(secretPath)}`,
+        `/v1/secrets/${encodeURIComponent(finalPath)}`,
         body,
       );
 
       if (res.statusCode === 200) {
         const typeStr = opts.type ? ` (${opts.type})` : '';
-        process.stderr.write(`Stored: ${secretPath}${typeStr}, ${res.body.bytes} bytes\n`);
+        process.stderr.write(`Stored: ${finalPath}${typeStr}, ${res.body.bytes} bytes\n`);
       } else {
         process.stderr.write(`Error: ${res.body.error}\n`);
         process.exit(1);
@@ -557,6 +624,87 @@ program
 
       if (res.statusCode === 200) {
         process.stderr.write(`Deleted: ${secretPath}\n`);
+      } else {
+        process.stderr.write(`Error: ${res.body.error}\n`);
+        process.exit(1);
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── secrets (rotation / expiry subcommands, US-009) ──────────────
+const secretsCmd = program
+  .command('secrets')
+  .description('Rotation and expiry management');
+
+secretsCmd
+  .command('expiring')
+  .description('List secrets expiring within a time window')
+  .option('--within <duration>', 'Time window (e.g., 7d, 24h, 1w)', '7d')
+  .action(async (opts) => {
+    try {
+      const port = ensureServerRunning();
+      const token = getServerToken();
+
+      const res = await request(
+        { port, host: '127.0.0.1', token },
+        'GET',
+        `/v1/secrets/expiring?within=${encodeURIComponent(opts.within)}`,
+      );
+
+      if (res.statusCode === 200) {
+        const entries = res.body.entries as Array<Record<string, unknown>>;
+        if (entries.length === 0) {
+          process.stderr.write(`No secrets expiring within ${opts.within}\n`);
+          return;
+        }
+        process.stderr.write(`Secrets expiring within ${opts.within}:\n\n`);
+        for (const entry of entries) {
+          const expiredTag = entry.expired ? ' [EXPIRED]' : '';
+          process.stderr.write(`  ${entry.path}${expiredTag}\n`);
+          process.stderr.write(`    expires_at: ${(entry.metadata as Record<string, unknown>)?.expires_at ?? 'N/A'}\n`);
+        }
+        process.stderr.write(`\n${entries.length} secret(s) found.\n`);
+      } else {
+        process.stderr.write(`Error: ${res.body.error}\n`);
+        process.exit(1);
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+secretsCmd
+  .command('stale')
+  .description('List secrets past their rotation interval')
+  .action(async () => {
+    try {
+      const port = ensureServerRunning();
+      const token = getServerToken();
+
+      const res = await request(
+        { port, host: '127.0.0.1', token },
+        'GET',
+        '/v1/secrets/stale',
+      );
+
+      if (res.statusCode === 200) {
+        const entries = res.body.entries as Array<Record<string, unknown>>;
+        if (entries.length === 0) {
+          process.stderr.write('No stale secrets found.\n');
+          return;
+        }
+        process.stderr.write('Stale secrets (past rotation interval):\n\n');
+        for (const entry of entries) {
+          const meta = entry.metadata as Record<string, unknown>;
+          process.stderr.write(`  ${entry.path}\n`);
+          process.stderr.write(`    rotation_interval: ${meta?.rotation_interval ?? 'N/A'}\n`);
+          process.stderr.write(`    last_rotated_at: ${meta?.last_rotated_at ?? entry.createdAt ?? 'N/A'}\n`);
+        }
+        process.stderr.write(`\n${entries.length} stale secret(s) found.\n`);
       } else {
         process.stderr.write(`Error: ${res.body.error}\n`);
         process.exit(1);
@@ -950,6 +1098,10 @@ program
   .description('Show recent audit log entries')
   .option('--path <path>', 'Filter by secret path (substring match)')
   .option('--token <name>', 'Filter by token name')
+  .option('--identity <name>', 'Filter by identity name or ID')
+  .option('--org <org>', 'Filter by organization name')
+  .option('--project <project>', 'Filter by project name')
+  .option('--operation <op>', 'Filter by operation type (e.g., auth.success, identity.created)')
   .option('--since <datetime>', 'Show entries since this date/time (ISO 8601)')
   .option('--limit <count>', 'Maximum number of entries to show', '50')
   .option('--tail', 'Follow the audit log in real-time')
@@ -991,6 +1143,10 @@ program
       const entries = readAuditLog(logPath, {
         path: opts.path,
         token: opts.token,
+        identity: opts.identity,
+        org: opts.org,
+        project: opts.project,
+        operation: opts.operation,
         since: opts.since,
         limit: parseInt(opts.limit, 10),
       });
@@ -1010,10 +1166,10 @@ program
       } else {
         // Formatted table output
         process.stdout.write(
-          `${'TIMESTAMP'.padEnd(24)} ${'OPERATION'.padEnd(16)} ${'TOKEN'.padEnd(20)} ${'PATH'.padEnd(30)} ${'IP'.padEnd(16)} DETAIL\n`,
+          `${'TIMESTAMP'.padEnd(24)} ${'OPERATION'.padEnd(24)} ${'TOKEN'.padEnd(20)} ${'PATH'.padEnd(30)} ${'IP'.padEnd(16)} DETAIL\n`,
         );
         process.stdout.write(
-          `${'─'.repeat(24)} ${'─'.repeat(16)} ${'─'.repeat(20)} ${'─'.repeat(30)} ${'─'.repeat(16)} ${'─'.repeat(20)}\n`,
+          `${'─'.repeat(24)} ${'─'.repeat(24)} ${'─'.repeat(20)} ${'─'.repeat(30)} ${'─'.repeat(16)} ${'─'.repeat(20)}\n`,
         );
         for (const entry of entries) {
           process.stdout.write(formatAuditEntry(entry) + '\n');
@@ -1029,14 +1185,24 @@ program
 
 /**
  * Format a single audit entry as a table row.
+ * Includes network audit fields (identity, org, project, mode) when present.
  */
 function formatAuditEntry(entry: AuditEntry): string {
   const ts = entry.timestamp.substring(0, 23).padEnd(24);
-  const op = entry.operation.padEnd(16);
+  const op = entry.operation.padEnd(24);
   const token = (entry.tokenName || '-').padEnd(20);
   const secretPath = (entry.secretPath || '-').padEnd(30);
   const ip = entry.ip.padEnd(16);
-  const detail = entry.detail || '';
+
+  // Build detail with network context when available
+  const parts: string[] = [];
+  if (entry.mode) parts.push(`mode=${entry.mode}`);
+  if (entry.identity_name) parts.push(`identity=${entry.identity_name}`);
+  if (entry.org) parts.push(`org=${entry.org}`);
+  if (entry.project) parts.push(`project=${entry.project}`);
+  if (entry.detail) parts.push(entry.detail);
+  const detail = parts.join(', ') || '';
+
   return `${ts} ${op} ${token} ${secretPath} ${ip} ${detail}`;
 }
 
@@ -1064,17 +1230,17 @@ program
 
       // Verify the passphrase against the vault before creating the backup
       const { VaultEngine } = await import('./vault.js');
-      const vault = new VaultEngine(vaultPath);
+      const vault = await VaultEngine.open(vaultPath);
       try {
-        vault.unlock(passphrase);
+        await vault.unlock(passphrase);
       } catch {
-        vault.close();
+        await vault.close();
         process.stderr.write('Error: Invalid passphrase\n');
         process.exit(1);
       }
-      vault.close();
+      await vault.close();
 
-      const result = createBackup(vaultPath, filepath, passphrase);
+      const result = await createBackup(vaultPath, filepath, passphrase);
       process.stderr.write(`Backup created: ${result.filepath}\n`);
       process.stderr.write(`Size: ${result.sizeBytes} bytes\n`);
       process.stderr.write('The backup is fully encrypted and safe to store in cloud storage or git.\n');
@@ -1117,7 +1283,7 @@ program
         process.exit(1);
       }
 
-      const result = restoreBackup(filepath, restorePath, passphrase);
+      const result = await restoreBackup(filepath, restorePath, passphrase);
       process.stderr.write(`Vault restored to: ${result.restoredPath}\n`);
       process.stderr.write(`Secrets: ${result.secretCount}\n`);
       process.stderr.write('Start the vault server with: hq-vault serve\n');
@@ -1236,10 +1402,10 @@ program
         }
 
         const { VaultEngine } = await import('./vault.js');
-        const vault = new VaultEngine(vaultPath);
+        const vault = await VaultEngine.open(vaultPath);
         try {
-          vault.unlock(passphrase);
-          const result = exportEnv(vault, opts.prefix);
+          await vault.unlock(passphrase);
+          const result = await exportEnv(vault, opts.prefix);
 
           if (result.entryCount === 0) {
             process.stderr.write('No secrets to export.\n');
@@ -1254,7 +1420,7 @@ program
             process.stderr.write(`\nExported ${result.entryCount} secret(s).\n`);
           }
         } finally {
-          vault.close();
+          await vault.close();
         }
       }
     } catch (err) {
@@ -1415,12 +1581,12 @@ program
         }
 
         const { VaultEngine } = await import('./vault.js');
-        const vault = new VaultEngine(vaultPath);
+        const vault = await VaultEngine.open(vaultPath);
         try {
-          vault.unlock(passphrase);
+          await vault.unlock(passphrase);
 
           // Detect duplicates and warn
-          const duplicates = detectImportDuplicates(vault, envContent, opts.prefix);
+          const duplicates = await detectImportDuplicates(vault, envContent, opts.prefix);
           if (duplicates.length > 0) {
             process.stderr.write(`\nWarning: ${duplicates.length} duplicate path(s) detected:\n`);
             for (const d of duplicates) {
@@ -1429,7 +1595,7 @@ program
             process.stderr.write(`Conflict strategy: ${strategy}\n\n`);
           }
 
-          const result = importEnv(vault, envContent, strategy, opts.prefix);
+          const result = await importEnv(vault, envContent, strategy, opts.prefix);
 
           process.stderr.write(`Import complete: ${result.imported} imported, ${result.skipped} skipped, ${result.overwritten} overwritten, ${result.renamed} renamed\n`);
           if (result.errors.length > 0) {
@@ -1440,8 +1606,973 @@ program
             process.exit(1);
           }
         } finally {
-          vault.close();
+          await vault.close();
         }
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── identity ───────────────────────────────────────────────────────
+const identityCmd = program
+  .command('identity')
+  .description('Manage vault identities');
+
+identityCmd
+  .command('create')
+  .description('Create a new identity with an Ed25519 keypair')
+  .requiredOption('--name <name>', 'Identity name')
+  .requiredOption('--type <type>', 'Identity type: human or agent')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const result = await idb.createIdentity(opts.name, opts.type);
+
+        // Audit: log identity creation (US-007)
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('identity.created', {
+          ip: '127.0.0.1',
+          identity_id: result.identity.id,
+          identity_name: result.identity.name,
+          mode: 'local',
+          detail: `type=${result.identity.type}`,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Identity created:\n`);
+        process.stdout.write(`  ID:   ${result.identity.id}\n`);
+        process.stdout.write(`  Name: ${result.identity.name}\n`);
+        process.stdout.write(`  Type: ${result.identity.type}\n`);
+        process.stdout.write(`\n`);
+        process.stdout.write(`Private key (save this — it will NOT be shown again):\n`);
+        process.stdout.write(`  ${result.privateKey}\n`);
+        process.stdout.write(`\n`);
+        process.stdout.write(`Public key:\n`);
+        process.stdout.write(`  ${result.publicKey}\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+identityCmd
+  .command('list')
+  .description('List all identities')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const identities = idb.listIdentities();
+
+        if (identities.length === 0) {
+          process.stderr.write('No identities found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(identities, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'ID'.padEnd(34)} ${'NAME'.padEnd(20)} ${'TYPE'.padEnd(8)} CREATED\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(20)} ${'─'.repeat(8)} ${'─'.repeat(20)}\n`,
+          );
+          for (const id of identities) {
+            process.stdout.write(
+              `${id.id.padEnd(34)} ${id.name.padEnd(20)} ${id.type.padEnd(8)} ${id.created_at}\n`,
+            );
+          }
+          process.stderr.write(`\n${identities.length} identity(ies).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+identityCmd
+  .command('verify')
+  .description('Verify an identity using its private key')
+  .requiredOption('--key <privateKey>', 'Base64-encoded Ed25519 private key')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const identity = await idb.verifyIdentity(opts.key);
+        if (identity) {
+          process.stdout.write(`Identity verified:\n`);
+          process.stdout.write(`  ID:   ${identity.id}\n`);
+          process.stdout.write(`  Name: ${identity.name}\n`);
+          process.stdout.write(`  Type: ${identity.type}\n`);
+        } else {
+          process.stderr.write('Error: Private key does not match any known identity.\n');
+          process.exit(1);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+identityCmd
+  .command('rotate-key')
+  .description('Rotate an identity\'s Ed25519 keypair')
+  .requiredOption('--identity <name>', 'Identity name')
+  .option('--grace-period <duration>', 'Allow both old and new key for this duration (e.g., 1h, 30m)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { parseDuration } = await import('./vault.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        // Look up identity by name
+        const identity = idb.getIdentityByName(opts.identity);
+        if (!identity) {
+          process.stderr.write(`Error: Identity '${opts.identity}' not found\n`);
+          process.exit(1);
+        }
+
+        // Parse grace period if provided
+        let gracePeriodMs: number | undefined;
+        if (opts.gracePeriod) {
+          const parsed = parseDuration(opts.gracePeriod);
+          if (parsed === null) {
+            process.stderr.write(`Error: Invalid grace period format '${opts.gracePeriod}'. Use e.g., 1h, 30m, 1d\n`);
+            process.exit(1);
+          }
+          gracePeriodMs = parsed;
+        }
+
+        const result = await idb.rotateKey(identity.id, gracePeriodMs);
+
+        // Audit: log key rotation
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('identity.key_rotated', {
+          ip: '127.0.0.1',
+          identity_id: identity.id,
+          identity_name: identity.name,
+          mode: 'local',
+          detail: `old_key_hash=${result.oldKeyHashPrefix}... new_key_hash=${result.newKeyHashPrefix}...${gracePeriodMs ? ` grace_period=${opts.gracePeriod}` : ''}`,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Key rotated for identity '${identity.name}':\n`);
+        process.stdout.write(`  Old key hash: ${result.oldKeyHashPrefix}...\n`);
+        process.stdout.write(`  New key hash: ${result.newKeyHashPrefix}...\n`);
+        if (gracePeriodMs) {
+          process.stdout.write(`  Grace period: ${opts.gracePeriod} (old key still valid until ${result.identity.old_key_expires_at})\n`);
+        } else {
+          process.stdout.write(`  Old key: immediately invalidated\n`);
+        }
+        process.stdout.write(`\n`);
+        process.stdout.write(`New private key (save this — it will NOT be shown again):\n`);
+        process.stdout.write(`  ${result.privateKey}\n`);
+        process.stdout.write(`\n`);
+        process.stdout.write(`New public key:\n`);
+        process.stdout.write(`  ${result.publicKey}\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── org ─────────────────────────────────────────────────────────────
+const orgCmd = program
+  .command('org')
+  .description('Manage organizations');
+
+orgCmd
+  .command('create')
+  .description('Create a new organization')
+  .requiredOption('--name <name>', 'Organization name')
+  .option('--identity <id>', 'Founding identity ID (assigned as admin)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const org = await idb.createOrg(opts.name, opts.identity);
+
+        // Audit: log org creation (US-007)
+        const founderIdentity = opts.identity ? idb.getIdentity(opts.identity) : null;
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('org.created', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity ?? null,
+          identity_name: founderIdentity?.name ?? null,
+          org: org.name,
+          mode: 'local',
+          detail: opts.identity ? `founder=${opts.identity}` : null,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Organization created:\n`);
+        process.stdout.write(`  ID:   ${org.id}\n`);
+        process.stdout.write(`  Name: ${org.name}\n`);
+        if (opts.identity) {
+          process.stdout.write(`  Founder: ${opts.identity} (admin)\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+orgCmd
+  .command('list')
+  .description('List all organizations')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const orgs = idb.listOrgs();
+
+        if (orgs.length === 0) {
+          process.stderr.write('No organizations found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(orgs, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'ID'.padEnd(34)} ${'NAME'.padEnd(24)} CREATED\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(24)} ${'─'.repeat(20)}\n`,
+          );
+          for (const org of orgs) {
+            process.stdout.write(
+              `${org.id.padEnd(34)} ${org.name.padEnd(24)} ${org.created_at}\n`,
+            );
+          }
+          process.stderr.write(`\n${orgs.length} organization(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+orgCmd
+  .command('add-member')
+  .description('Add a member to an organization')
+  .requiredOption('--org <org>', 'Organization name or ID')
+  .requiredOption('--identity <identityId>', 'Identity ID to add')
+  .requiredOption('--role <role>', 'Role: admin, member, or readonly')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        const orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        idb.addOrgMember(orgId, opts.identity, opts.role);
+
+        // Audit: log membership addition (US-007)
+        const memberIdentity = idb.getIdentity(opts.identity);
+        const orgRecord = idb.getOrg(orgId);
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('membership.added', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity,
+          identity_name: memberIdentity?.name ?? null,
+          org: orgRecord?.name ?? orgId,
+          mode: 'local',
+          detail: `role=${opts.role}`,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Added identity ${opts.identity} to org ${orgRecord?.name ?? orgId} as ${opts.role}.\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+orgCmd
+  .command('members')
+  .description('List members of an organization')
+  .requiredOption('--org <org>', 'Organization name or ID')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        const orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        const members = idb.listOrgMembers(orgId);
+
+        if (members.length === 0) {
+          process.stderr.write('No members found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(members, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'IDENTITY ID'.padEnd(34)} ${'NAME'.padEnd(20)} ${'TYPE'.padEnd(8)} ROLE\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(20)} ${'─'.repeat(8)} ${'─'.repeat(10)}\n`,
+          );
+          for (const m of members) {
+            process.stdout.write(
+              `${m.identity_id.padEnd(34)} ${m.name.padEnd(20)} ${m.type.padEnd(8)} ${m.role}\n`,
+            );
+          }
+          process.stderr.write(`\n${members.length} member(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── project ─────────────────────────────────────────────────────────
+const projectCmd = program
+  .command('project')
+  .description('Manage projects within organizations');
+
+projectCmd
+  .command('create')
+  .description('Create a new project within an organization')
+  .requiredOption('--org <org>', 'Organization name or ID')
+  .requiredOption('--name <name>', 'Project name')
+  .option('--identity <id>', 'Founding identity ID (assigned as admin)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        let orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        const project = await idb.createProject(orgId, opts.name, opts.identity);
+
+        // Audit: log project creation (US-007)
+        const orgRecord = idb.getOrg(orgId);
+        const founderIdentity = opts.identity ? idb.getIdentity(opts.identity) : null;
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('project.created', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity ?? null,
+          identity_name: founderIdentity?.name ?? null,
+          org: orgRecord?.name ?? opts.org,
+          project: project.name,
+          mode: 'local',
+          detail: opts.identity ? `founder=${opts.identity}` : null,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Project created:\n`);
+        process.stdout.write(`  ID:   ${project.id}\n`);
+        process.stdout.write(`  Name: ${project.name}\n`);
+        process.stdout.write(`  Org:  ${project.org_id}\n`);
+        if (opts.identity) {
+          process.stdout.write(`  Founder: ${opts.identity} (admin)\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('list')
+  .description('List projects in an organization')
+  .requiredOption('--org <org>', 'Organization name or ID')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        const orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        const projects = idb.listProjects(orgId);
+
+        if (projects.length === 0) {
+          process.stderr.write('No projects found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(projects, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'ID'.padEnd(34)} ${'NAME'.padEnd(24)} CREATED\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(24)} ${'─'.repeat(20)}\n`,
+          );
+          for (const p of projects) {
+            process.stdout.write(
+              `${p.id.padEnd(34)} ${p.name.padEnd(24)} ${p.created_at}\n`,
+            );
+          }
+          process.stderr.write(`\n${projects.length} project(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('add-member')
+  .description('Add a member to a project')
+  .requiredOption('--project <projectId>', 'Project ID')
+  .requiredOption('--identity <identityId>', 'Identity ID to add')
+  .requiredOption('--role <role>', 'Role: admin, member, or readonly')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        idb.addProjectMember(opts.project, opts.identity, opts.role);
+
+        // Audit: log project membership addition (US-007)
+        const memberIdentity = idb.getIdentity(opts.identity);
+        const projectRecord = idb.getProject(opts.project);
+        const orgRecord = projectRecord ? idb.getOrg(projectRecord.org_id) : null;
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('membership.added', {
+          ip: '127.0.0.1',
+          identity_id: opts.identity,
+          identity_name: memberIdentity?.name ?? null,
+          org: orgRecord?.name ?? null,
+          project: projectRecord?.name ?? opts.project,
+          mode: 'local',
+          detail: `role=${opts.role}`,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Added identity ${opts.identity} to project ${opts.project} as ${opts.role}.\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+projectCmd
+  .command('members')
+  .description('List members of a project')
+  .requiredOption('--project <projectId>', 'Project ID')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const members = idb.listProjectMembers(opts.project);
+
+        if (members.length === 0) {
+          process.stderr.write('No members found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(members, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'IDENTITY ID'.padEnd(34)} ${'NAME'.padEnd(20)} ${'TYPE'.padEnd(8)} ROLE\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(20)} ${'─'.repeat(8)} ${'─'.repeat(10)}\n`,
+          );
+          for (const m of members) {
+            process.stdout.write(
+              `${m.identity_id.padEnd(34)} ${m.name.padEnd(20)} ${m.type.padEnd(8)} ${m.role}\n`,
+            );
+          }
+          process.stderr.write(`\n${members.length} member(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── config ─────────────────────────────────────────────────────────
+const configCmd = program
+  .command('config')
+  .description('Manage vault client configuration (remote connections, identity auth)');
+
+configCmd
+  .command('set <field> <value>')
+  .description(
+    'Set a configuration value. Fields: remote-url, identity, key-file, ca-cert',
+  )
+  .action((field: string, value: string) => {
+    try {
+      const resolved = resolveFieldName(field);
+      if (!resolved) {
+        process.stderr.write(
+          `Error: Unknown config field '${field}'.\n` +
+            `Valid fields: ${getValidFields().map((f) => f.replace(/_/g, '-')).join(', ')}\n`,
+        );
+        process.exit(1);
+      }
+
+      setConfigField(resolved, value);
+      process.stderr.write(`Set ${field} = ${value}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : err}\n`,
+      );
+      process.exit(1);
+    }
+  });
+
+configCmd
+  .command('show')
+  .description('Display current configuration (private key paths redacted)')
+  .option('--json', 'Output as JSON')
+  .action((opts) => {
+    try {
+      const config = readConfig();
+      const display = formatConfigForDisplay(config);
+
+      if (Object.keys(display).length === 0) {
+        process.stderr.write('No configuration set.\n');
+        process.stderr.write(
+          `Config file: ${getDefaultConfigPath()}\n`,
+        );
+        process.stderr.write(
+          '\nSet values with: hq-vault config set <field> <value>\n',
+        );
+        process.stderr.write(
+          `Valid fields: ${getValidFields().map((f) => f.replace(/_/g, '-')).join(', ')}\n`,
+        );
+        return;
+      }
+
+      if (opts.json) {
+        process.stdout.write(JSON.stringify(display, null, 2) + '\n');
+      } else {
+        process.stdout.write('Current configuration:\n\n');
+        for (const [key, val] of Object.entries(display)) {
+          process.stdout.write(`  ${key.padEnd(14)} ${val}\n`);
+        }
+        process.stdout.write(
+          `\nConfig file: ${getDefaultConfigPath()}\n`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : err}\n`,
+      );
+      process.exit(1);
+    }
+  });
+
+configCmd
+  .command('unset <field>')
+  .description('Remove a configuration value')
+  .action((field: string) => {
+    try {
+      const resolved = resolveFieldName(field);
+      if (!resolved) {
+        process.stderr.write(
+          `Error: Unknown config field '${field}'.\n` +
+            `Valid fields: ${getValidFields().map((f) => f.replace(/_/g, '-')).join(', ')}\n`,
+        );
+        process.exit(1);
+      }
+
+      const config = readConfig();
+      delete config[resolved];
+      writeConfig(config);
+      process.stderr.write(`Unset ${field}\n`);
+    } catch (err) {
+      process.stderr.write(
+        `Error: ${err instanceof Error ? err.message : err}\n`,
+      );
+      process.exit(1);
+    }
+  });
+
+// ─── auth ───────────────────────────────────────────────────────────
+const authCmd = program
+  .command('auth')
+  .description('Network authentication (challenge-response)');
+
+authCmd
+  .command('login')
+  .description('Authenticate using Ed25519 keypair (challenge-response flow)')
+  .requiredOption('--identity <name>', 'Identity name')
+  .requiredOption('--key <path>', 'Path to Ed25519 private key file (base64)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const port = ensureServerRunning();
+
+      // Read the private key from file
+      if (!fs.existsSync(opts.key)) {
+        process.stderr.write(`Error: Key file not found: ${opts.key}\n`);
+        process.exit(1);
+      }
+      const privateKeyBase64 = fs.readFileSync(opts.key, 'utf-8').trim();
+
+      // We need to extract the public key from the private key and the identity ID
+      // Look up the identity by name in the identity database
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      let identityId: string;
+      let publicKeyBase64: string;
+      try {
+        const identity = idb.getIdentityByName(opts.identity);
+        if (!identity) {
+          process.stderr.write(`Error: Identity '${opts.identity}' not found\n`);
+          process.exit(1);
+        }
+        identityId = identity.id;
+
+        // Extract public key from private key using sodium
+        const sodium = (await import('libsodium-wrappers-sumo')).default;
+        await sodium.ready;
+        const secretKey = Buffer.from(privateKeyBase64, 'base64');
+        if (secretKey.length !== sodium.crypto_sign_SECRETKEYBYTES) {
+          process.stderr.write(`Error: Invalid private key length\n`);
+          process.exit(1);
+        }
+        const publicKey = Buffer.from(sodium.crypto_sign_ed25519_sk_to_pk(new Uint8Array(secretKey)));
+        publicKeyBase64 = publicKey.toString('base64');
+
+        // Step 1: Request a challenge
+        const challengeRes = await request(
+          { port, host: '127.0.0.1', token: undefined, insecure: true },
+          'POST',
+          '/v1/auth/challenge',
+          { identity_id: identityId },
+        );
+
+        if (challengeRes.statusCode !== 200) {
+          process.stderr.write(`Error: Failed to get challenge: ${(challengeRes.body as Record<string, unknown>).error || 'unknown error'}\n`);
+          process.exit(1);
+        }
+
+        const challengeNonce = Buffer.from(challengeRes.body.challenge as string, 'base64url');
+        const challengeId = challengeRes.body.challenge_id as string;
+
+        // Step 2: Sign the challenge nonce
+        const { ed25519Sign } = await import('./network-auth.js');
+        const signature = await ed25519Sign(challengeNonce, secretKey);
+        const signatureBase64url = signature.toString('base64url');
+
+        // Zero out the secret key
+        sodium.memzero(secretKey);
+
+        // Step 3: Verify the signature and get a session token
+        const verifyRes = await request(
+          { port, host: '127.0.0.1', token: undefined, insecure: true },
+          'POST',
+          '/v1/auth/verify',
+          {
+            challenge_id: challengeId,
+            identity_id: identityId,
+            signature: signatureBase64url,
+            public_key: publicKeyBase64,
+          },
+        );
+
+        if (verifyRes.statusCode !== 200) {
+          process.stderr.write(`Error: Authentication failed: ${(verifyRes.body as Record<string, unknown>).error || 'unknown error'}\n`);
+          process.exit(1);
+        }
+
+        const sessionToken = verifyRes.body.session_token as string;
+        const expiresIn = verifyRes.body.expires_in as number;
+
+        // Cache the session token to the token file location
+        const { getVaultDir } = await import('./server.js');
+        const path = await import('node:path');
+        const sessionTokenFile = path.join(getVaultDir(), 'session-token');
+        fs.writeFileSync(sessionTokenFile, sessionToken, { encoding: 'utf-8', mode: 0o600 });
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify({
+            ok: true,
+            identity_id: identityId,
+            identity_name: opts.identity,
+            session_token_file: sessionTokenFile,
+            expires_in: expiresIn,
+          }, null, 2) + '\n');
+        } else {
+          process.stdout.write(`Authenticated as '${opts.identity}' (${identityId})\n`);
+          process.stdout.write(`Session token cached at: ${sessionTokenFile}\n`);
+          process.stdout.write(`Expires in: ${expiresIn} seconds\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+// ─── access-requests ────────────────────────────────────────────────
+const accessRequestsCmd = program
+  .command('access-requests')
+  .description('Manage access requests (agent access request + human approval flow)');
+
+accessRequestsCmd
+  .command('list')
+  .description('List access requests')
+  .option('--org <org>', 'Filter by organization name')
+  .option('--status <status>', 'Filter by status: pending, approved, denied')
+  .option('--identity-db <path>', 'Path to identity database')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { AccessRequestManager } = await import('./access-requests.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const arm = new AccessRequestManager(idb);
+
+        // Clean expired requests first
+        arm.cleanExpired();
+
+        const filters: Record<string, string> = {};
+        if (opts.org) filters.org = opts.org;
+        if (opts.status) filters.status = opts.status;
+
+        const requests = arm.listRequests(filters);
+
+        if (requests.length === 0) {
+          process.stderr.write('No access requests found.\n');
+          return;
+        }
+
+        if (opts.json) {
+          process.stdout.write(JSON.stringify(requests, null, 2) + '\n');
+        } else {
+          process.stdout.write(
+            `${'REQUEST ID'.padEnd(34)} ${'ORG'.padEnd(16)} ${'PROJECT'.padEnd(16)} ${'ROLE'.padEnd(10)} ${'STATUS'.padEnd(10)} JUSTIFICATION\n`,
+          );
+          process.stdout.write(
+            `${'─'.repeat(34)} ${'─'.repeat(16)} ${'─'.repeat(16)} ${'─'.repeat(10)} ${'─'.repeat(10)} ${'─'.repeat(30)}\n`,
+          );
+          for (const r of requests) {
+            const proj = r.project || '-';
+            const justTrunc = r.justification.length > 30 ? r.justification.slice(0, 27) + '...' : r.justification;
+            process.stdout.write(
+              `${r.request_id.padEnd(34)} ${r.org.padEnd(16)} ${proj.padEnd(16)} ${r.role_requested.padEnd(10)} ${r.status.padEnd(10)} ${justTrunc}\n`,
+            );
+          }
+          process.stderr.write(`\n${requests.length} access request(s).\n`);
+        }
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+accessRequestsCmd
+  .command('approve <requestId>')
+  .description('Approve an access request (creates membership automatically)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (requestId: string, opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { AccessRequestManager } = await import('./access-requests.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const arm = new AccessRequestManager(idb);
+        const result = arm.approveRequest(requestId, 'cli-admin');
+
+        // Audit: log access request approval (US-007)
+        const reqIdentity = idb.getIdentity(result.identity_id);
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('access_request.approved', {
+          ip: '127.0.0.1',
+          identity_id: result.identity_id,
+          identity_name: reqIdentity?.name ?? null,
+          org: result.org,
+          project: result.project,
+          mode: 'local',
+          detail: `request_id=${result.request_id}, role=${result.role_requested}, reviewed_by=cli-admin`,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Access request approved:\n`);
+        process.stdout.write(`  Request ID: ${result.request_id}\n`);
+        process.stdout.write(`  Identity:   ${result.identity_id}\n`);
+        process.stdout.write(`  Org:        ${result.org}\n`);
+        if (result.project) {
+          process.stdout.write(`  Project:    ${result.project}\n`);
+        }
+        process.stdout.write(`  Role:       ${result.role_requested}\n`);
+        process.stdout.write(`  Status:     ${result.status}\n`);
+        process.stdout.write(`Membership created successfully.\n`);
+      } finally {
+        idb.close();
+      }
+    } catch (err) {
+      process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);
+      process.exit(1);
+    }
+  });
+
+accessRequestsCmd
+  .command('deny <requestId>')
+  .description('Deny an access request')
+  .option('--reason <reason>', 'Denial reason (visible to the requesting agent)')
+  .option('--identity-db <path>', 'Path to identity database')
+  .action(async (requestId: string, opts) => {
+    try {
+      const { IdentityDatabase, getDefaultIdentityDbPath } = await import('./identity.js');
+      const { AccessRequestManager } = await import('./access-requests.js');
+      const dbPath = opts.identityDb || getDefaultIdentityDbPath();
+      const idb = await IdentityDatabase.open(dbPath);
+
+      try {
+        const arm = new AccessRequestManager(idb);
+        const result = arm.denyRequest(requestId, 'cli-admin', opts.reason);
+
+        // Audit: log access request denial (US-007)
+        const reqIdentity = idb.getIdentity(result.identity_id);
+        const auditLogger = new AuditLogger();
+        auditLogger.logNetworkEvent('access_request.denied', {
+          ip: '127.0.0.1',
+          identity_id: result.identity_id,
+          identity_name: reqIdentity?.name ?? null,
+          org: result.org,
+          project: result.project,
+          mode: 'local',
+          detail: `request_id=${result.request_id}, reviewed_by=cli-admin${opts.reason ? ', reason=' + opts.reason : ''}`,
+        });
+        auditLogger.close();
+
+        process.stdout.write(`Access request denied:\n`);
+        process.stdout.write(`  Request ID: ${result.request_id}\n`);
+        process.stdout.write(`  Identity:   ${result.identity_id}\n`);
+        process.stdout.write(`  Org:        ${result.org}\n`);
+        if (result.project) {
+          process.stdout.write(`  Project:    ${result.project}\n`);
+        }
+        process.stdout.write(`  Status:     ${result.status}\n`);
+        if (result.denial_reason) {
+          process.stdout.write(`  Reason:     ${result.denial_reason}\n`);
+        }
+      } finally {
+        idb.close();
       }
     } catch (err) {
       process.stderr.write(`Error: ${err instanceof Error ? err.message : err}\n`);

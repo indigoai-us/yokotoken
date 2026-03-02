@@ -291,7 +291,11 @@ function buildTBSCertificate(params: TBSCertParams): Buffer {
 
 /**
  * Build Subject Alternative Name extension value.
- * Contains: DNS:localhost, IP:127.0.0.1, IP:::1
+ * Contains: DNS:localhost, IP:127.0.0.1, IP:::1, IP:0.0.0.0
+ *
+ * The 0.0.0.0 address is included to support network mode where the server
+ * binds to all interfaces. For production, use CA-signed certificates with
+ * proper DNS names via --tls-cert / --tls-key.
  */
 function buildSANExtension(): Buffer {
   // DNS name (tag 2)
@@ -319,7 +323,15 @@ function buildSANExtension(): Buffer {
     ipv6,
   ]);
 
-  return encodeSequence(dnsEntry, ipv4Entry, ipv6Entry);
+  // IPv4 address (tag 7): 0.0.0.0 (for network mode binding)
+  const ipv4Any = Buffer.from([0, 0, 0, 0]);
+  const ipv4AnyEntry = Buffer.concat([
+    Buffer.from([0x87]),
+    encodeLength(ipv4Any.length),
+    ipv4Any,
+  ]);
+
+  return encodeSequence(dnsEntry, ipv4Entry, ipv6Entry, ipv4AnyEntry);
 }
 
 function buildCertificate(tbsCert: Buffer, signature: Buffer): Buffer {

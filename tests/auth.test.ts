@@ -140,10 +140,10 @@ describe('Auth — server rejects unauthorized requests', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('test/secret', 'my-value');
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('test/secret', 'my-value');
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     port = getPort(server);

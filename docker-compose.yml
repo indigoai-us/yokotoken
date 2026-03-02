@@ -1,0 +1,56 @@
+# hq-vault — Dockerized network vault deployment
+#
+# Quick start:
+#   docker compose run vault init          # Initialize vault (first run)
+#   docker compose run vault identity create --name admin --type human
+#   docker compose up -d                   # Start vault in network mode
+#
+# Data is persisted in the vault-data volume at /data inside the container.
+
+services:
+  vault:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hq-vault
+    restart: unless-stopped
+
+    ports:
+      - "${HQ_VAULT_PORT:-13100}:${HQ_VAULT_PORT:-13100}"
+
+    volumes:
+      - vault-data:/data
+
+    environment:
+      - HQ_VAULT_PORT=${HQ_VAULT_PORT:-13100}
+      - HQ_VAULT_DATA_DIR=/data
+      - HQ_VAULT_DIR=/data
+      - HQ_VAULT_NETWORK=true
+      - HQ_VAULT_IDLE_TIMEOUT=${HQ_VAULT_IDLE_TIMEOUT:-0}
+      # TLS: provide cert/key via env vars or mount into /data/certs/
+      - HQ_VAULT_TLS_CERT=${HQ_VAULT_TLS_CERT:-}
+      - HQ_VAULT_TLS_KEY=${HQ_VAULT_TLS_KEY:-}
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "--spider", "-q", "https://localhost:${HQ_VAULT_PORT:-13100}/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # Security: drop all capabilities, add only what's needed
+    cap_drop:
+      - ALL
+
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+        reservations:
+          memory: 64M
+
+volumes:
+  vault-data:
+    driver: local

@@ -4,6 +4,14 @@
  * Designed to be the primary interface for programmatic vault access.
  * Auto-discovers vault URL and token from environment variables.
  *
+ * Supports two authentication modes:
+ * 1. Token-based: Uses HQ_VAULT_TOKEN (existing behavior)
+ * 2. Identity-based: Uses HQ_VAULT_IDENTITY + HQ_VAULT_KEY_FILE/HQ_VAULT_PRIVATE_KEY
+ *    for challenge-response auth with session token caching (US-006)
+ *
+ * Identity-based auth is automatically selected when identity + key env vars are set.
+ * Token-based auth is used as fallback.
+ *
  * Usage:
  *   import { getSecret, storeSecret, listSecrets } from 'hq-vault/sdk';
  *
@@ -12,11 +20,16 @@
  *   const entries = await listSecrets('aws/');
  *
  * Environment variables:
- *   HQ_VAULT_URL   — Vault server URL (default: https://localhost:13100)
- *   HQ_VAULT_TOKEN — Bearer token for authentication (required)
+ *   HQ_VAULT_URL         — Vault server URL (default: https://localhost:13100)
+ *   HQ_VAULT_TOKEN       — Bearer token for token-based auth
+ *   HQ_VAULT_IDENTITY    — Identity name for challenge-response auth
+ *   HQ_VAULT_KEY_FILE    — Path to Ed25519 private key file
+ *   HQ_VAULT_PRIVATE_KEY — Base64-encoded Ed25519 private key (alternative to key file)
+ *   HQ_VAULT_CA_CERT     — Path to custom CA certificate for self-signed server certs
  */
 
 import { request, type ClientConfig } from './client.js';
+import { NetworkVaultClient, NetworkClientError } from './network-client.js';
 
 /** Default vault server URL when HQ_VAULT_URL is not set. */
 const DEFAULT_VAULT_URL = 'https://localhost:13100';
@@ -44,6 +57,14 @@ export interface VaultSdkConfig {
   url?: string;
   /** Bearer token for authentication (overrides HQ_VAULT_TOKEN). */
   token?: string;
+  /** Identity name for challenge-response auth (overrides HQ_VAULT_IDENTITY). */
+  identity?: string;
+  /** Path to Ed25519 private key file (overrides HQ_VAULT_KEY_FILE). */
+  keyFile?: string;
+  /** Base64-encoded Ed25519 private key (overrides HQ_VAULT_PRIVATE_KEY). */
+  privateKey?: string;
+  /** Path to custom CA certificate (overrides HQ_VAULT_CA_CERT). */
+  caCert?: string;
 }
 
 /**
@@ -64,7 +85,31 @@ export class VaultSdkError extends Error {
 }
 
 /**
- * Parse the vault URL into a ClientConfig.
+ * Determine whether identity-based auth should be used based on config and env vars.
+ */
+function shouldUseIdentityAuth(config?: VaultSdkConfig): boolean {
+  const identity = config?.identity || process.env.HQ_VAULT_IDENTITY;
+  const keyFile = config?.keyFile || process.env.HQ_VAULT_KEY_FILE;
+  const privateKey = config?.privateKey || process.env.HQ_VAULT_PRIVATE_KEY;
+  return !!(identity && (keyFile || privateKey));
+}
+
+/**
+ * Create a NetworkVaultClient from SDK config.
+ */
+function createNetworkClient(config?: VaultSdkConfig): NetworkVaultClient {
+  return new NetworkVaultClient({
+    url: config?.url,
+    token: config?.token,
+    identity: config?.identity,
+    keyFile: config?.keyFile,
+    privateKey: config?.privateKey,
+    caCert: config?.caCert,
+  });
+}
+
+/**
+ * Parse the vault URL into a ClientConfig (legacy token-based path).
  * Supports both http and https URLs.
  */
 function resolveConfig(overrides?: VaultSdkConfig): ClientConfig {
@@ -73,7 +118,8 @@ function resolveConfig(overrides?: VaultSdkConfig): ClientConfig {
 
   if (!token) {
     throw new VaultSdkError(
-      'No vault token provided. Set HQ_VAULT_TOKEN environment variable or pass token in config.',
+      'No vault authentication configured. Set HQ_VAULT_TOKEN for token auth, ' +
+        'or set HQ_VAULT_IDENTITY + HQ_VAULT_KEY_FILE for identity auth.',
       'NO_TOKEN',
     );
   }
@@ -102,6 +148,34 @@ function resolveConfig(overrides?: VaultSdkConfig): ClientConfig {
 }
 
 /**
+ * Execute a vault request using the appropriate auth method.
+ * Uses NetworkVaultClient for identity-based auth, legacy client for token auth.
+ */
+async function vaultRequest(
+  method: string,
+  urlPath: string,
+  config?: VaultSdkConfig,
+  body?: Record<string, unknown>,
+): Promise<{ statusCode: number; body: Record<string, unknown> }> {
+  if (shouldUseIdentityAuth(config)) {
+    const client = createNetworkClient(config);
+    try {
+      return await client.request(method, urlPath, body);
+    } catch (err) {
+      throw wrapConnectionError(err);
+    }
+  }
+
+  // Legacy token-based path
+  const clientConfig = resolveConfig(config);
+  try {
+    return await request(clientConfig, method, urlPath, body);
+  } catch (err) {
+    throw wrapConnectionError(err);
+  }
+}
+
+/**
  * Get a decrypted secret value from the vault.
  *
  * @param path - The secret path (e.g. 'aws/access-key', 'slack/indigo/token')
@@ -115,18 +189,11 @@ function resolveConfig(overrides?: VaultSdkConfig): ClientConfig {
  * ```
  */
 export async function getSecret(path: string, config?: VaultSdkConfig): Promise<string> {
-  const clientConfig = resolveConfig(config);
-
-  let res;
-  try {
-    res = await request(
-      clientConfig,
-      'GET',
-      `/v1/secrets/${encodeURIComponent(path)}`,
-    );
-  } catch (err) {
-    throw wrapConnectionError(err);
-  }
+  const res = await vaultRequest(
+    'GET',
+    `/v1/secrets/${encodeURIComponent(path)}`,
+    config,
+  );
 
   if (res.statusCode === 200) {
     return res.body.value as string;
@@ -150,7 +217,7 @@ export async function getSecret(path: string, config?: VaultSdkConfig): Promise<
 
   if (res.statusCode === 401) {
     throw new VaultSdkError(
-      'Authentication failed. Check your HQ_VAULT_TOKEN.',
+      'Authentication failed. Check your credentials.',
       'UNAUTHORIZED',
       401,
     );
@@ -182,23 +249,16 @@ export async function storeSecret(
   metadata?: SecretMetadata,
   config?: VaultSdkConfig,
 ): Promise<void> {
-  const clientConfig = resolveConfig(config);
-
   const body: Record<string, unknown> = { value };
   if (metadata?.type) body.type = metadata.type;
   if (metadata?.description) body.description = metadata.description;
 
-  let res;
-  try {
-    res = await request(
-      clientConfig,
-      'PUT',
-      `/v1/secrets/${encodeURIComponent(path)}`,
-      body,
-    );
-  } catch (err) {
-    throw wrapConnectionError(err);
-  }
+  const res = await vaultRequest(
+    'PUT',
+    `/v1/secrets/${encodeURIComponent(path)}`,
+    config,
+    body,
+  );
 
   if (res.statusCode === 200) {
     return;
@@ -214,7 +274,7 @@ export async function storeSecret(
 
   if (res.statusCode === 401) {
     throw new VaultSdkError(
-      'Authentication failed. Check your HQ_VAULT_TOKEN.',
+      'Authentication failed. Check your credentials.',
       'UNAUTHORIZED',
       401,
     );
@@ -246,20 +306,13 @@ export async function listSecrets(
   prefix?: string,
   config?: VaultSdkConfig,
 ): Promise<SecretEntry[]> {
-  const clientConfig = resolveConfig(config);
-
   const queryStr = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
 
-  let res;
-  try {
-    res = await request(
-      clientConfig,
-      'GET',
-      `/v1/secrets${queryStr}`,
-    );
-  } catch (err) {
-    throw wrapConnectionError(err);
-  }
+  const res = await vaultRequest(
+    'GET',
+    `/v1/secrets${queryStr}`,
+    config,
+  );
 
   if (res.statusCode === 200) {
     const entries = res.body.entries as Array<{
@@ -286,7 +339,7 @@ export async function listSecrets(
 
   if (res.statusCode === 401) {
     throw new VaultSdkError(
-      'Authentication failed. Check your HQ_VAULT_TOKEN.',
+      'Authentication failed. Check your credentials.',
       'UNAUTHORIZED',
       401,
     );
@@ -307,9 +360,15 @@ function wrapConnectionError(err: unknown): VaultSdkError {
   if (err instanceof VaultSdkError) {
     return err;
   }
+
+  // Wrap NetworkClientError
+  if (err instanceof NetworkClientError) {
+    return new VaultSdkError(err.message, err.code, err.statusCode);
+  }
+
   const message = err instanceof Error ? err.message : String(err);
 
-  if (message.includes('not running')) {
+  if (message.includes('not running') || message.includes('Cannot connect')) {
     return new VaultSdkError(
       'Vault server is not running. Start it with: hq-vault serve',
       'CONNECTION_REFUSED',

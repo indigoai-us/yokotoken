@@ -71,9 +71,9 @@ describe('Secrets — locked vault rejects all operations', () => {
     tmpDir = result.tmpDir;
 
     // Pre-initialize but leave locked
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
   });
@@ -123,9 +123,9 @@ describe('Secrets — PUT /v1/secrets/:path (store)', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
 
@@ -227,12 +227,12 @@ describe('Secrets — GET /v1/secrets/:path (get)', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('aws/access-key', 'AKIA-1234', { type: 'api-key', description: 'AWS dev key' });
-    vault.store('aws/secret-key', 'wJalr-5678', { type: 'api-key' });
-    vault.store('github/pat', 'ghp_abcdef', { type: 'api-key', description: 'GitHub PAT' });
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('aws/access-key', 'AKIA-1234', { type: 'api-key', description: 'AWS dev key' });
+    await vault.store('aws/secret-key', 'wJalr-5678', { type: 'api-key' });
+    await vault.store('github/pat', 'ghp_abcdef', { type: 'api-key', description: 'GitHub PAT' });
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     const client = clientFor(server);
@@ -291,14 +291,14 @@ describe('Secrets — GET /v1/secrets (list)', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('aws/dev/access-key', 'AKIA-dev', { type: 'api-key' });
-    vault.store('aws/dev/secret-key', 'secret-dev', { type: 'api-key' });
-    vault.store('aws/prod/access-key', 'AKIA-prod', { type: 'api-key' });
-    vault.store('slack/token', 'xoxb-1234', { type: 'oauth-token', description: 'Bot token' });
-    vault.store('github/pat', 'ghp_xxx', { type: 'api-key' });
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('aws/dev/access-key', 'AKIA-dev', { type: 'api-key' });
+    await vault.store('aws/dev/secret-key', 'secret-dev', { type: 'api-key' });
+    await vault.store('aws/prod/access-key', 'AKIA-prod', { type: 'api-key' });
+    await vault.store('slack/token', 'xoxb-1234', { type: 'oauth-token', description: 'Bot token' });
+    await vault.store('github/pat', 'ghp_xxx', { type: 'api-key' });
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     const client = clientFor(server);
@@ -379,12 +379,12 @@ describe('Secrets — DELETE /v1/secrets/:path (delete)', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('to-delete/key1', 'value1');
-    vault.store('to-delete/key2', 'value2');
-    vault.store('keep/this', 'important');
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('to-delete/key1', 'value1');
+    await vault.store('to-delete/key2', 'value2');
+    await vault.store('keep/this', 'important');
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     const client = clientFor(server);
@@ -452,9 +452,9 @@ describe('Secrets — lock/unlock persistence', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
   });
@@ -505,10 +505,10 @@ describe('Secrets — value security', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.store('secret/key', 'super-secret-value-12345', { type: 'api-key' });
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.store('secret/key', 'super-secret-value-12345', { type: 'api-key' });
+    await vault.close();
 
     server = await createVaultServer(result.config) as http.Server;
     const client = clientFor(server);

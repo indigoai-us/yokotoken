@@ -149,9 +149,9 @@ describe('Ingest — basic store flow', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(server);
@@ -223,9 +223,9 @@ describe('Ingest — secret value NEVER in output', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(server);
@@ -288,9 +288,9 @@ describe('Ingest — overwrite protection', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(server);
@@ -366,9 +366,9 @@ describe('Ingest — locked vault flow', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     // Start server but do NOT unlock — vault stays locked
     server = (await createVaultServer(result.config)) as http.Server;
@@ -439,9 +439,9 @@ describe('Ingest — byte count in output', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(server);
@@ -499,9 +499,9 @@ describe('Ingest — edge cases', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     server = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(server);

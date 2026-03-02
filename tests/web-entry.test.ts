@@ -207,9 +207,9 @@ describe('Web entry — basic store flow', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     vaultServer = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(vaultServer);
@@ -341,9 +341,9 @@ describe('Web entry — one-time token enforcement', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     vaultServer = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(vaultServer);
@@ -453,9 +453,9 @@ describe('Web entry — token expiry', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     vaultServer = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(vaultServer);
@@ -540,9 +540,9 @@ describe('Web entry — invalid requests', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     vaultServer = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(vaultServer);
@@ -686,9 +686,9 @@ describe('Web entry — secret value never in terminal output', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     vaultServer = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(vaultServer);
@@ -762,9 +762,9 @@ describe('Web entry — server lifecycle', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     vaultServer = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(vaultServer);
@@ -853,9 +853,9 @@ describe('Web entry — edge cases', () => {
     const result = createTmpConfig();
     tmpDir = result.tmpDir;
 
-    const vault = new VaultEngine(result.config.vaultPath);
-    vault.init(PASSPHRASE);
-    vault.close();
+    const vault = await VaultEngine.open(result.config.vaultPath);
+    await vault.init(PASSPHRASE);
+    await vault.close();
 
     vaultServer = (await createVaultServer(result.config)) as http.Server;
     const client = clientFor(vaultServer);
