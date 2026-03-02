@@ -1903,7 +1903,7 @@ orgCmd
 orgCmd
   .command('add-member')
   .description('Add a member to an organization')
-  .requiredOption('--org <orgId>', 'Organization ID')
+  .requiredOption('--org <org>', 'Organization name or ID')
   .requiredOption('--identity <identityId>', 'Identity ID to add')
   .requiredOption('--role <role>', 'Role: admin, member, or readonly')
   .option('--identity-db <path>', 'Path to identity database')
@@ -1914,23 +1914,30 @@ orgCmd
       const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        idb.addOrgMember(opts.org, opts.identity, opts.role);
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        const orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        idb.addOrgMember(orgId, opts.identity, opts.role);
 
         // Audit: log membership addition (US-007)
         const memberIdentity = idb.getIdentity(opts.identity);
-        const orgRecord = idb.getOrg(opts.org);
+        const orgRecord = idb.getOrg(orgId);
         const auditLogger = new AuditLogger();
         auditLogger.logNetworkEvent('membership.added', {
           ip: '127.0.0.1',
           identity_id: opts.identity,
           identity_name: memberIdentity?.name ?? null,
-          org: orgRecord?.name ?? opts.org,
+          org: orgRecord?.name ?? orgId,
           mode: 'local',
           detail: `role=${opts.role}`,
         });
         auditLogger.close();
 
-        process.stdout.write(`Added identity ${opts.identity} to org ${opts.org} as ${opts.role}.\n`);
+        process.stdout.write(`Added identity ${opts.identity} to org ${orgRecord?.name ?? orgId} as ${opts.role}.\n`);
       } finally {
         idb.close();
       }
@@ -1943,7 +1950,7 @@ orgCmd
 orgCmd
   .command('members')
   .description('List members of an organization')
-  .requiredOption('--org <orgId>', 'Organization ID')
+  .requiredOption('--org <org>', 'Organization name or ID')
   .option('--identity-db <path>', 'Path to identity database')
   .option('--json', 'Output as JSON')
   .action(async (opts) => {
@@ -1953,7 +1960,14 @@ orgCmd
       const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        const members = idb.listOrgMembers(opts.org);
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        const orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        const members = idb.listOrgMembers(orgId);
 
         if (members.length === 0) {
           process.stderr.write('No members found.\n');
@@ -1993,7 +2007,7 @@ const projectCmd = program
 projectCmd
   .command('create')
   .description('Create a new project within an organization')
-  .requiredOption('--org <orgId>', 'Organization ID')
+  .requiredOption('--org <org>', 'Organization name or ID')
   .requiredOption('--name <name>', 'Project name')
   .option('--identity <id>', 'Founding identity ID (assigned as admin)')
   .option('--identity-db <path>', 'Path to identity database')
@@ -2004,10 +2018,17 @@ projectCmd
       const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        const project = await idb.createProject(opts.org, opts.name, opts.identity);
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        let orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        const project = await idb.createProject(orgId, opts.name, opts.identity);
 
         // Audit: log project creation (US-007)
-        const orgRecord = idb.getOrg(opts.org);
+        const orgRecord = idb.getOrg(orgId);
         const founderIdentity = opts.identity ? idb.getIdentity(opts.identity) : null;
         const auditLogger = new AuditLogger();
         auditLogger.logNetworkEvent('project.created', {
@@ -2040,7 +2061,7 @@ projectCmd
 projectCmd
   .command('list')
   .description('List projects in an organization')
-  .requiredOption('--org <orgId>', 'Organization ID')
+  .requiredOption('--org <org>', 'Organization name or ID')
   .option('--identity-db <path>', 'Path to identity database')
   .option('--json', 'Output as JSON')
   .action(async (opts) => {
@@ -2050,7 +2071,14 @@ projectCmd
       const idb = await IdentityDatabase.open(dbPath);
 
       try {
-        const projects = idb.listProjects(opts.org);
+        // Resolve org name to ID if needed
+        let orgId = opts.org;
+        const orgByName = idb.getOrgByName(opts.org);
+        if (orgByName) {
+          orgId = orgByName.id;
+        }
+
+        const projects = idb.listProjects(orgId);
 
         if (projects.length === 0) {
           process.stderr.write('No projects found.\n');
