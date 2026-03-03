@@ -1,17 +1,17 @@
-# hq-vault
+# yokotoken
 
 Agent-native encrypted credential vault with libsodium encryption.
 
-[![npm version](https://img.shields.io/npm/v/hq-vault)](https://www.npmjs.com/package/hq-vault)
-[![license](https://img.shields.io/npm/l/hq-vault)](./LICENSE)
+[![npm version](https://img.shields.io/npm/v/yokotoken)](https://www.npmjs.com/package/yokotoken)
+[![license](https://img.shields.io/npm/l/yokotoken)](./LICENSE)
 [![tests](https://img.shields.io/github/actions/workflow/status/indigoai-us/hq-vault/ci.yml?label=tests)](https://github.com/indigoai-us/hq-vault/actions)
 
-hq-vault is a local-first secrets manager built for AI agents and developer workflows. It uses XSalsa20-Poly1305 encryption (via libsodium) with Argon2id key derivation to protect credentials at rest, and exposes them over a localhost HTTPS API with token or identity-based authentication.
+yokotoken is a local-first secrets manager built for AI agents and developer workflows. It uses XSalsa20-Poly1305 encryption (via libsodium) with Argon2id key derivation to protect credentials at rest, and exposes them over a localhost HTTPS API with token or identity-based authentication.
 
 ## Install
 
 ```bash
-npm install -g hq-vault
+npm install -g yokotoken
 ```
 
 Requires Node.js 20 or later.
@@ -20,22 +20,22 @@ Requires Node.js 20 or later.
 
 ```bash
 # Create a new vault (you'll be prompted for a passphrase)
-hq-vault init
+yokotoken init
 
 # Start the vault server
-hq-vault serve
+yokotoken serve
 
 # Store a secret
-hq-vault store aws/access-key AKIAIOSFODNN7EXAMPLE
+yokotoken store aws/access-key AKIAIOSFODNN7EXAMPLE
 
 # Retrieve it
-hq-vault get aws/access-key
+yokotoken get aws/access-key
 ```
 
 ## SDK Usage
 
 ```typescript
-import { getSecret, storeSecret, listSecrets } from 'hq-vault/sdk';
+import { getSecret, storeSecret, listSecrets } from 'yokotoken/sdk';
 
 const apiKey = await getSecret('aws/access-key');
 await storeSecret('slack/token', 'xoxb-...', { type: 'oauth-token' });
@@ -49,7 +49,7 @@ The SDK auto-discovers the vault URL and auth token from environment variables (
 For multi-vault topologies, use the network client:
 
 ```typescript
-import { NetworkVaultClient } from 'hq-vault/client';
+import { NetworkVaultClient } from 'yokotoken/client';
 
 const client = new NetworkVaultClient({
   url: 'https://vault.internal:13100',
@@ -63,8 +63,8 @@ const secret = await client.get('shared/api-key');
 ## Docker
 
 ```bash
-docker build -t hq-vault .
-docker run -v vault-data:/data -p 13100:13100 hq-vault serve
+docker build -t yokotoken .
+docker run -v vault-data:/data -p 13100:13100 yokotoken serve
 ```
 
 ## Documentation

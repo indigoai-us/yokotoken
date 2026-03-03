@@ -1,11 +1,12 @@
 {
-  "name": "hq-vault",
-  "version": "0.1.0",
+  "name": "yokotoken",
+  "version": "0.1.1",
   "description": "Agent-native encrypted credential vault with libsodium encryption",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
+    "yokotoken": "dist/cli.js",
     "hq-vault": "dist/cli.js"
   },
   "files": [
