@@ -39,11 +39,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/indigoai-us/hq-vault.git"
+    "url": "https://github.com/indigoai-us/yokotoken.git"
   },
   "homepage": "https://hq-vault-docs.vercel.app",
   "bugs": {
-    "url": "https://github.com/indigoai-us/hq-vault/issues"
+    "url": "https://github.com/indigoai-us/yokotoken/issues"
   },
   "license": "MIT",
   "keywords": [
