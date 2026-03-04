@@ -24,6 +24,7 @@ import path from 'node:path';
 import {
   generateToken,
   writeTokenFile,
+  readTokenFile,
   validateBearerToken,
   RateLimiter,
   type RateLimitConfig,
@@ -1085,7 +1086,7 @@ export async function createVaultServer(config: ServerConfig): Promise<https.Ser
 
   // Generate or retrieve the bearer token
   const tokenFile = config.tokenFile || path.join(path.dirname(config.pidFile), 'token');
-  const token = config.token || generateToken();
+  const token = config.token || readTokenFile(tokenFile) || generateToken();
 
   // Write the token file (even in network mode, for internal management)
   writeTokenFile(tokenFile, token);
